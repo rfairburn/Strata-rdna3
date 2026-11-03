@@ -82,6 +82,83 @@ int main() {
         check(cache.retained_bytes() == 0 && cache.size() == 1 && cache.evictions() == 0,
               "pressure drops retained storage before evicting parked conversations");
     }
+    {
+        ConversationBuffer bytes;
+        const size_t held = ConversationBuffer::segment_bytes;
+        bytes.resize(held, 7);
+        const size_t peak = bytes.allocation_peak(held + 1);
+        bytes.resize(held + 1, 9);
+        check(bytes.bytes() <= peak, "bounded reserve is included in the capture estimate");
+        check(bytes.bytes() <= held + held / 8 + 1024, "a tiny append does not reserve another full segment");
+        uint8_t ends[2] = {};
+        check(bytes.read(ends, held - 1, 2) && ends[0] == 7 && ends[1] == 9,
+              "bounded reserve preserves the old prefix and new suffix");
+    }
+    {
+        auto layer = [] { ConversationKv k; k.k.resize(64, 7); return k; };
+        ConversationCache cache(8192, 4);
+        std::vector<ConversationKv> layers{layer()};
+        std::vector<std::vector<ConversationKv>> stages{{layer()}};
+        cache.retain(std::move(layers), 4, std::move(stages), {1, 2, 3, 4});
+        auto partial = cache.take_reuse_for(std::vector<int32_t>{1, 2, 9, 8});
+        check(partial.unchanged_tokens == 2 && partial.stages[0].unchanged_tokens == 2,
+              "retained main and stage K/V stop at the actual conversation prefix");
+        check(partial.ids.empty() && cache.retained_bytes() == 0, "identity metadata is released before capture admission");
+        layers = {layer()};
+        cache.retain(std::move(layers), 4, {}, {1, 2, 3, 4});
+        check(cache.take_reuse_for(std::vector<int32_t>{9, 8, 7}).kv.empty(),
+              "a batch switch cannot reuse another conversation's K/V");
+        layers = {layer()};
+        cache.retain(std::move(layers), 4, {}, {1, 2, 3, 4});
+        cache.limit_reuse(2);
+        check(cache.take_reuse_for(std::vector<int32_t>{1, 2, 3, 4, 5}).unchanged_tokens == 2,
+              "identity matching does not undo a prior rewrite boundary");
+        layers = {layer()};
+        cache.retain(std::move(layers), 4);
+        check(cache.take_reuse_for(std::vector<int32_t>{1, 2, 3, 4}).kv.empty(),
+              "retained storage without a conversation identity is not reused");
+        layers = {layer()};
+        cache.retain(std::move(layers), 4, {}, {1, 2, 3, 4});
+        cache.take_reuse();
+        check(cache.take_reuse_for(std::vector<int32_t>{1, 2, 3, 4}).kv.empty(),
+              "slot replacement discards retained storage even for identical token IDs");
+    }
+    {
+        ConversationCheckpoint root, chosen, wrong, longer, picture;
+        root.ids = {1}; root.pinned = true; root.stage_parts.resize(3); root.stage_parts[2].gdn = {7};
+        chosen.ids = {1, 2}; wrong.ids = {9}; longer.ids = {1, 2, 3};
+        picture.ids = {1}; picture.imgs = {{0, 99}};
+        std::vector<ConversationCheckpoint> source{root, chosen, wrong, longer, picture}, restored;
+        check(conversation_slot_checkpoints(restored, source, chosen.ids, &source[1]), "copy a slot's checkpoint chain");
+        check(restored.size() == 2 && restored[0].ids == chosen.ids && restored[1].ids == root.ids,
+              "chosen checkpoint is first and only compatible shorter checkpoints follow");
+        check(restored[1].pinned && restored[1].stage_parts[2].gdn == std::vector<uint8_t>{7},
+              "slot return preserves pinned and layer-split checkpoint state");
+        restored.clear();
+        check(conversation_slot_checkpoints(restored, source, std::vector<int32_t>{1, 2, 4}),
+              "returning a live slot also restores its branch points");
+        check(restored.size() == 2, "wrong branches, image checkpoints and longer states are excluded");
+    }
+    {
+        ConversationCache cache(64 * 1024 * 1024, 1000);
+        std::vector<std::vector<int32_t>> ids(4);
+        std::vector<std::vector<ConversationCheckpoint>> slots(4);
+        for (int s = 0; s < 4; ++s) ids[s] = {100 + s};
+        for (int turn = 0; turn < 64; ++turn) for (int s = 0; s < 4; ++s) {
+            std::vector<ConversationCheckpoint> chain;
+            check(conversation_slot_checkpoints(chain, slots[s], ids[s]), "carry checkpoint chain on repeated slot return");
+            ConversationCheckpoint next; next.ids = ids[s]; next.gdn.resize(32, 7);
+            chain.push_back(next);
+            ids[s].push_back(1000 + turn); ids[s].push_back(2000 + turn);
+            SavedConversation saved; saved.live.ids = ids[s]; saved.checkpoints = chain;
+            saved.kv.resize(1); saved.kv[0].k.resize(16384, 7);
+            check(cache.put(std::move(saved)), "park an advancing interleaved conversation");
+            slots[s] = {next};
+            check(cache.size() <= 4, "successive turns replace obsolete images rather than accumulating full copies");
+        }
+        check(cache.size() == 4 && cache.superseded() == 252 && cache.evictions() == 0,
+              "four working conversations remain bounded without LRU eviction");
+    }
     const std::vector<int64_t> a = {1, 2, 3, 4}, b = {9, 8, 7, 6};
     {
         ConversationCache cache(1024, 2);
@@ -383,6 +460,84 @@ int main() {
         p2.checkpoints.back().gdn.resize(64, 1);
         check(tiny.put(std::move(p2)), "a pinned one fits an empty cache");
         check(!tiny.put(image({7,8,9})) && tiny.size() == 1, "nothing else fits beside it: parking is refused, the pin stays");
+    }
+    {
+        auto saved = image({1, 2, 3, 4, 5});
+        ConversationCheckpoint root;
+        root.ids = {1, 2, 3};
+        saved.checkpoints.push_back(root);
+        ConversationCache cache(4096, 4);
+        cache.put(std::move(saved));
+        check(cache.holds(std::vector<int32_t>{1,2,3,4,5}, {}, true), "parked live state covers a slot");
+        check(cache.holds(std::vector<int32_t>{1,2}, {}, true), "a parked checkpoint covers its prefix");
+        check(!cache.holds(std::vector<int32_t>{1,2,3,4,5,6}, {}, true), "a longer reply still needs parking");
+        check(!cache.holds(std::vector<int32_t>{1,2,9}, {}, true), "another conversation is not covered");
+        check(!cache.holds(std::vector<int32_t>{}, {}, true), "empty state is not covered");
+        check(!cache.holds(std::vector<int32_t>{1,2}, {}, false), "coverage keeps steering isolated");
+        auto pictures = image({1,2,3,4});
+        pictures.live.imgs = {{1,77},{3,78}};
+        cache.put(std::move(pictures));
+        check(cache.holds(std::vector<int32_t>{1,2,3}, {{1,77}}, true), "coverage checks pictures below the prefix");
+        check(!cache.holds(std::vector<int32_t>{1,2,3,4}, {{1,77}}, true), "missing pictures invalidate coverage");
+    }
+    {
+        auto cp = [](std::vector<int32_t> ids) { ConversationCheckpoint c; c.ids=std::move(ids); return c; };
+        auto main_copy = image({1,2,3,4,10,11,12});
+        main_copy.checkpoints = {cp({1,2,3,4}),cp({1,2,3,4,10,11})};
+        ConversationCache cache(1<<20,4);
+        check(cache.put(std::move(main_copy)), "park a parent with its root and turn checkpoints");
+        const std::vector<int32_t> slot_ids{1,2,3,4,10,11,12,20,21};
+        const std::vector<ConversationCheckpoint> slot_chain{cp({1,2,3,4,10,11})};
+        check(cache.supersedes_richer(slot_ids,{},slot_chain,true), "slot parking must preserve the richer parent's root");
+        check(!cache.supersedes_richer(slot_ids,{}, {cp({1,2,3,4}),cp({1,2,3,4,10,11})},true), "a complete chain loses no root");
+        check(!cache.supersedes_richer(slot_ids,{},slot_chain,false), "richer-chain protection isolates steering");
+        check(!cache.supersedes_richer({1,2,3,4,30,31},{},{cp({1,2,3,4,30})},true), "a sibling supersedes no parent");
+        check(cache.size()==1 && cache.superseded()==0, "richer-chain inspection changes no entries");
+        check(cache.best(std::vector<int32_t>{1,2,3,4,40},{},true).tokens==4, "the shared root remains reusable");
+    }
+    {
+        // Upstream's two-slot, four-conversation reply-retention replay.
+        auto replay = [&](bool slot_parks, bool checks_back) {
+            std::vector<std::vector<int32_t>> full(4);
+            for (int c=0;c<4;++c) {
+                for (int32_t t=1;t<=8;++t) full[c].push_back(c*100+t);
+                for (int32_t t:{21,22,23,9,31,32,41,42,43,44,9,51,52}) full[c].push_back(c*100+t);
+            }
+            auto ids = [&](int c,size_t n) { return std::vector<int32_t>(full[c].begin(),full[c].begin()+n); };
+            auto cp = [&](int c,size_t n) { ConversationCheckpoint k; k.ids=ids(c,n); return k; };
+            auto park = [&](ConversationCache& cache,int c,size_t n,const std::vector<size_t>& chain) {
+                auto saved=image({}); saved.live.ids=ids(c,n);
+                for (size_t k:chain) saved.checkpoints.push_back(cp(c,k));
+                check(cache.put(std::move(saved)),"reply replay stays within its budget");
+            };
+            auto restore = [&](ConversationCache& cache,int c,size_t n) {
+                const auto match=cache.best(ids(c,n),{},true);
+                if (match.tokens>0) cache.take(match.index);
+                return match.tokens;
+            };
+            auto back = [&](const std::vector<size_t>& chain) { return checks_back?chain:std::vector<size_t>{}; };
+            auto slot_park = [&](ConversationCache& cache,int c,size_t n,const std::vector<size_t>& chain) {
+                if (slot_parks && !cache.holds(ids(c,n),{},true)) park(cache,c,n,chain);
+            };
+            enum {A,B,C,D};
+            ConversationCache cache(1<<20,4);
+            park(cache,B,9,{4}); park(cache,A,8,{4});
+            auto chain_a=back({4});
+            park(cache,A,12,chain_a);
+            auto chain_b=back({4}); chain_b.push_back(12);
+            check(restore(cache,A,14)==12,"second turn resumes its parked main state");
+            park(cache,B,15,chain_b); chain_a.push_back(12);
+            park(cache,A,14,chain_a); slot_park(cache,B,17,{12});
+            park(cache,D,9,{4}); slot_park(cache,A,17,{12});
+            park(cache,C,8,{4}); auto chain_c=back({4}); chain_c.push_back(12);
+            park(cache,C,15,chain_c); auto chain_d=back({4}); chain_d.push_back(12);
+            const auto found_a=restore(cache,A,21);
+            park(cache,D,14,chain_d); slot_park(cache,C,17,{12}); park(cache,A,22,{12,20});
+            return std::pair<int64_t,int64_t>(found_a,restore(cache,B,21));
+        };
+        check(replay(false,false)==std::make_pair<int64_t,int64_t>(14,0),"old paths lose reply state and one conversation");
+        check(replay(true,false)==std::make_pair<int64_t,int64_t>(17,0),"slot parking alone cannot replace checkpoint preservation");
+        check(replay(true,true)==std::make_pair<int64_t,int64_t>(17,17),"both upstream fixes retain both completed replies");
     }
     std::printf("conversation_cache_test: %d checks passed\n", checks);
 }

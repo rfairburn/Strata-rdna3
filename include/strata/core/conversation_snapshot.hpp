@@ -15,16 +15,23 @@ size_t conversation_kv_bytes(const QsaState& state, const ModelGeometry& g, int6
 // A nonzero unchanged_tokens is valid only for storage retained from an image
 // actually restored into this session, bounded by every subsequent rewrite.
 // Equal token IDs alone do not establish that its K/V bytes are unchanged.
+// Private diagnostic overlay: trace_qsa is the global QSA ordinal (-1 for draft/unknown),
+// metadata only, ignored with STRATA_PARK_TRACE unset. Same convention for restore/copy below.
 bool conversation_kv_save(ConversationKv& image, const QsaState& state, const ModelGeometry& g,
                           int64_t upto, bool include_index, std::string& error,
-                          int64_t unchanged_tokens = 0, size_t* reused_bytes = nullptr);
+                          int64_t unchanged_tokens = 0, size_t* reused_bytes = nullptr, int64_t trace_qsa = -1,
+                          bool prepared_storage = false);
 bool conversation_kv_capture_bytes(const ConversationKv& image, const QsaState& state, const ModelGeometry& g,
-                                   int64_t upto, bool include_index, size_t& bytes, std::string& error);
+                                   int64_t upto, bool include_index, size_t& bytes, std::string& error,
+                                   bool prepared_storage = false);
 // No CUDA calls or destination writes. Used for whole-session prevalidation.
 bool conversation_kv_validate(const ConversationKv& image, const QsaState& state, const ModelGeometry& g,
                               int64_t upto, bool include_index, std::string& error);
 bool conversation_kv_restore(const ConversationKv& image, const QsaState& state, const ModelGeometry& g,
-                             int64_t upto, bool include_index, std::string& error);
+                             int64_t upto, bool include_index, std::string& error, int64_t trace_qsa = -1);
+// Copy between authoritative pools without allocating a temporary host snapshot.
+bool conversation_kv_copy(const QsaState& from, const QsaState& to, const ModelGeometry& g,
+                          int64_t upto, bool include_index, std::string& error, int64_t trace_qsa = -1);
 // Diagnostic read-back after a synchronized restore. Uses 64 KiB of stack
 // workspace, compares authoritative bytes and resident draft-ring pages, and
 // fingerprints the authoritative payload only. Never changes model state.
@@ -43,6 +50,21 @@ bool conversation_kv_part_sizes(const QsaState& state, const ModelGeometry& g, i
 bool conversation_session_read_limits(SessionReadLimits& limits, const SessionState& session, const ModelGeometry& g,
                                       const QsaState& draft, uint64_t max_tokens, uint64_t max_checkpoints,
                                       std::string& error);
+
+struct ConversationView;
+// Pure metadata plan, then destructive preparation of already-retired scratch.
+// Validate ALL stages and admit summed directory_allocation before preparing any.
+// No new payload allocation is made here. The normal RAM gate follows trimming.
+struct ConversationStoragePlan {
+    size_t kept = 0, kept_full = 0, released = 0, directory_allocation = 0;
+    size_t fresh = 0, preparation_peak = 0;
+};
+bool conversation_snapshot_storage_plan(const ConversationKvReuse& reuse, const ConversationView& view,
+                                        const SessionState& session, const ModelGeometry& g, const QsaState* draft,
+                                        ConversationStoragePlan& plan, std::string& error);
+bool conversation_snapshot_storage_prepare(ConversationKvReuse& reuse, const ConversationView& view,
+                                           const SessionState& session, const ModelGeometry& g, const QsaState* draft,
+                                           std::string& error);
 
 struct ConversationStateSizes {
     size_t gdn = 0, ple = 0, tail = 0, dead = 0, block_pos = 0;

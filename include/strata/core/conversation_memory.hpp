@@ -64,11 +64,21 @@ std::optional<HostMemoryReading> sample_host_memory();
 
 std::optional<uint64_t> available_host_bytes();
 
+// Return allocator-free pages to the OS where supported. Live allocations stay intact.
+void reclaim_host_memory();
+
 std::optional<uint64_t> conversation_mem_available(std::istream& meminfo);
 
 inline bool conversation_memory_admit(std::optional<uint64_t> available,
                                       uint64_t allocation, uint64_t floor) {
     return available && *available >= floor && allocation <= *available - floor;
+}
+
+template<class Admit, class Reclaim>
+bool conversation_memory_retry(Admit admit, Reclaim reclaim) {
+    if (admit()) return true;
+    reclaim();
+    return admit();
 }
 
 } // namespace strata::core

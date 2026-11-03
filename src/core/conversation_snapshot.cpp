@@ -5,6 +5,9 @@
 #include <cuda_runtime.h>
 
 #include <array>
+#include <chrono>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <memory>
@@ -110,11 +113,19 @@ bool valid(const QsaState& st, const Layout& l, int64_t upto, std::string& error
     return true;
 }
 
-bool transfer(void* dst, const void* src, size_t n, std::string& error) {
+const char* kv_source_class(const QsaState& st, size_t part) {
+    // Logical provenance from pools(), not a runtime pointer-attribute claim.
+    return part == 4 ? "deviceindexer" : st.kv_mode != 0 ? "mappedhostKV" : "deviceKV";
+}
+constexpr const char* copy_parts[5] = {"K", "V", "Kscale", "Vscale", "pooledindexer"};
+using conversation_detail::CopyPartTrace;
+
+bool transfer(void* dst, const void* src, size_t n, std::string& error,
+              CopyPartTrace* part = nullptr, size_t offset = 0, size_t chunk = 0) {
     if (!n) return true;
     if (!src || !dst) { error = "conversation snapshot: missing state buffer"; return false; }
     // Default handles both device allocations and device-mapped host pool aliases.
-    const cudaError_t e = conversation_detail::copy_nonblocking(dst, src, n);
+    const cudaError_t e = conversation_detail::copy_nonblocking(dst, src, n, part, offset, chunk);
     if (e == cudaSuccess) return true;
     error = std::string("conversation snapshot copy: ") + cudaGetErrorString(e);
     return false;
@@ -122,14 +133,20 @@ bool transfer(void* dst, const void* src, size_t n, std::string& error) {
 } // namespace
 
 bool conversation_kv_capture_bytes(const ConversationKv& image, const QsaState& st, const ModelGeometry& g,
-                                   int64_t upto, bool index, size_t& bytes, std::string& error) {
+                                   int64_t upto, bool index, size_t& bytes, std::string& error, bool prepared_storage) {
     Layout l{};
     if (!layout(st, g, upto, index, l, error) || !valid(st, l, upto, error)) return false;
     const std::array<size_t,5> sizes = {l.data, l.value_data, l.scales, l.value_scales, l.pooled};
     const std::array<const ConversationBuffer*,5> buffers = {&image.k, &image.v, &image.k_scale, &image.v_scale, &image.pooled};
+    if (prepared_storage && (image.format || image.cells || image.heads || image.head_dim ||
+        image.page_size || image.pooled_rows || image.idx_dim)) {
+        error = "conversation snapshot: prepared storage has snapshot metadata";
+        return false;
+    }
     bytes = 0;
     for (size_t i = 0; i < buffers.size(); ++i) {
-        const size_t n = buffers[i]->allocation_peak(sizes[i]);
+        const size_t n = prepared_storage ? buffers[i]->overwrite_allocation_peak(sizes[i])
+                                          : buffers[i]->allocation_peak(sizes[i]);
         if (n == SIZE_MAX || !conversation_detail::add(bytes, n)) {
             error = "conversation snapshot: segmented K/V allocation overflow";
             return false;
@@ -146,7 +163,12 @@ size_t conversation_kv_bytes(const QsaState& st, const ModelGeometry& g, int64_t
 
 bool conversation_kv_save(ConversationKv& image, const QsaState& st, const ModelGeometry& g,
                           int64_t upto, bool index, std::string& error,
-                          int64_t unchanged_tokens, size_t* reused_bytes) {
+                          int64_t unchanged_tokens, size_t* reused_bytes, int64_t trace_qsa, bool prepared_storage) {
+    if (prepared_storage) {
+        size_t ignored = 0;
+        if (unchanged_tokens != 0) { error = "conversation snapshot: prepared storage prefix"; return false; }
+        if (!conversation_kv_capture_bytes(image, st, g, upto, index, ignored, error, true)) return false;
+    }
     Layout l{};
     if (!layout(st, g, upto, index, l, error)) return false;
     if (!valid(st, l, upto, error)) return false;
@@ -165,18 +187,38 @@ bool conversation_kv_save(ConversationKv& image, const QsaState& st, const Model
     const auto src = pools(st);
     const std::array<size_t,5> sizes = {l.data, l.value_data, l.scales, l.value_scales, l.pooled};
     const std::array<ConversationBuffer*,5> dst = {&image.k, &image.v, &image.k_scale, &image.v_scale, &image.pooled};
+    static const bool trace = std::getenv("STRATA_PARK_TRACE") != nullptr;
+    auto tick = [] { return trace ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{}; };
+    auto ms = [](auto a, auto b) { return std::chrono::duration<double, std::milli>(b - a).count(); };
+    double resize_ms = 0, copy_ms = 0;
     for (size_t i = 0; i < dst.size(); ++i) {
         // Recopy the partial page and the indexer's moving spare row. Completed
         // pages/rows strictly before the first rewritten token remain identical.
         const size_t keep = i == 4 ? (index ? size_t(unchanged_tokens / strata::kernels::qsa_real_shapes().idx_block) * g.idx_key_dim * 4 : 0)
                                   : l.cells ? (sizes[i] / size_t(l.cells)) * size_t(whole_cells) : 0;
         if (keep > dst[i]->size()) { error = "conversation snapshot: missing reusable prefix"; return false; }
-        dst[i]->resize(sizes[i]);
-        if (!dst[i]->visit(keep, sizes[i] - keep, [&](uint8_t* p, size_t n, size_t at) {
-                return transfer(p, src[i] ? static_cast<const uint8_t*>(src[i]) + at : nullptr, n, error);
-            })) return false;
+        const auto t0 = tick();
+        if (prepared_storage) {
+            if (!dst[i]->resize_overwrite(sizes[i])) {
+                error = "conversation snapshot: invalid prepared allocation";
+                return false;
+            }
+        } else dst[i]->resize(sizes[i]);
+        const auto t1 = tick();
+        CopyPartTrace part("capture", index ? "qsa" : "draft", trace_qsa, copy_parts[i],
+                           kv_source_class(st, i), "snapshotHost", st.kv_mode, -1);
+        size_t chunk = 0;
+        const bool copied = dst[i]->visit(keep, sizes[i] - keep, [&](uint8_t* p, size_t n, size_t at) {
+                return transfer(p, src[i] ? static_cast<const uint8_t*>(src[i]) + at : nullptr,
+                                n, error, &part, at, chunk++);
+            });
+        if (trace) { resize_ms += ms(t0, t1); copy_ms += ms(t1, tick()); }
+        if (!copied) return false;
         if (reused_bytes) *reused_bytes += keep;
     }
+    if (trace)
+        std::fprintf(stderr, "strata parktrace: kv tokens=%lld index=%d resize=%.3f ms copy=%.3f ms\n",
+                     (long long) upto, index ? 1 : 0, resize_ms, copy_ms);
     return true;
 }
 
@@ -201,17 +243,9 @@ bool conversation_kv_validate(const ConversationKv& image, const QsaState& st, c
     return true;
 }
 
-bool conversation_kv_restore(const ConversationKv& image, const QsaState& st, const ModelGeometry& g,
-                             int64_t upto, bool index, std::string& error) {
-    if (!conversation_kv_validate(image, st, g, upto, index, error)) return false;
-    const std::array<const ConversationBuffer*,5> src = {&image.k, &image.v, &image.k_scale, &image.v_scale, &image.pooled};
-    const auto dst = pools(st);
-    for (size_t i = 0; i < src.size(); ++i)
-        if (!src[i]->visit(0, src[i]->size(), [&](const uint8_t* p, size_t n, size_t at) {
-                return transfer(static_cast<uint8_t*>(dst[i]) + at, p, n, error);
-            })) return false;
-    // VRAM slots still contain the outgoing conversation. Resolve must refill
-    // them from the restored authoritative pools before any attention reads.
+namespace {
+bool refresh_residency(const QsaState& st, const ModelGeometry& g, int64_t upto, std::string& error) {
+    // Resolve must refill VRAM slots from the new authoritative pools.
     if (st.kv_mode == 1) strata::kernels::kv_stream_reset(st.map, nullptr);
     if (st.kv_mode == 2 && upto > 0) {
         auto shapes = strata::kernels::qsa_real_shapes();
@@ -224,6 +258,64 @@ bool conversation_kv_restore(const ConversationKv& image, const QsaState& st, co
     if (status == cudaSuccess) return true;
     error = std::string("conversation snapshot residency restore: ") + cudaGetErrorString(status);
     return false;
+}
+} // namespace
+
+bool conversation_kv_copy(const QsaState& from, const QsaState& to, const ModelGeometry& g,
+                          int64_t upto, bool index, std::string& error, int64_t trace_qsa) {
+    Layout source{}, target{};
+    if (!layout(from, g, upto, index, source, error) || !valid(from, source, upto, error) ||
+        !layout(to, g, upto, index, target, error) || !valid(to, target, upto, error)) return false;
+    if (source.format != target.format || source.cells != target.cells || source.page_size != target.page_size ||
+        source.pooled_rows != target.pooled_rows || source.data != target.data ||
+        source.value_data != target.value_data || source.scales != target.scales ||
+        source.value_scales != target.value_scales || source.pooled != target.pooled) {
+        error = "conversation snapshot: direct K/V copy between different layouts";
+        return false;
+    }
+    const auto src = pools(from);
+    const auto dst = pools(to);
+    const std::array<size_t, 5> sizes = {source.data, source.value_data, source.scales, source.value_scales, source.pooled};
+    static const bool trace = std::getenv("STRATA_PARK_TRACE") != nullptr;
+    auto tick = [] { return trace ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{}; };
+    const auto t0 = tick();
+    for (size_t i = 0; i < sizes.size(); ++i) {
+        CopyPartTrace part("handoff", index ? "qsa" : "draft", trace_qsa, copy_parts[i],
+                           kv_source_class(from, i), kv_source_class(to, i), from.kv_mode, to.kv_mode);
+        if (!transfer(dst[i], src[i], sizes[i], error, &part)) return false;
+    }
+    const auto t1 = tick();
+    const bool ok = refresh_residency(to, g, upto, error);
+    if (trace)
+        std::fprintf(stderr, "strata parktrace: kv_copy tokens=%lld transfer=%.3f ms refresh=%.3f ms success=%d\n",
+                     (long long) upto, std::chrono::duration<double, std::milli>(t1 - t0).count(),
+                     std::chrono::duration<double, std::milli>(tick() - t1).count(), ok ? 1 : 0);
+    return ok;
+}
+
+bool conversation_kv_restore(const ConversationKv& image, const QsaState& st, const ModelGeometry& g,
+                             int64_t upto, bool index, std::string& error, int64_t trace_qsa) {
+    if (!conversation_kv_validate(image, st, g, upto, index, error)) return false;
+    const std::array<const ConversationBuffer*,5> src = {&image.k, &image.v, &image.k_scale, &image.v_scale, &image.pooled};
+    const auto dst = pools(st);
+    static const bool trace = std::getenv("STRATA_PARK_TRACE") != nullptr;
+    auto tick = [] { return trace ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{}; };
+    const auto t0 = tick();
+    for (size_t i = 0; i < src.size(); ++i) {
+        CopyPartTrace part("restore", index ? "qsa" : "draft", trace_qsa, copy_parts[i],
+                           "snapshotHost", kv_source_class(st, i), -1, st.kv_mode);
+        size_t chunk = 0;
+        if (!src[i]->visit(0, src[i]->size(), [&](const uint8_t* p, size_t n, size_t at) {
+                return transfer(static_cast<uint8_t*>(dst[i]) + at, p, n, error, &part, at, chunk++);
+            })) return false;
+    }
+    const auto t1 = tick();
+    const bool ok = refresh_residency(st, g, upto, error);
+    if (trace)
+        std::fprintf(stderr, "strata parktrace: kv_restore tokens=%lld transfer=%.3f ms refresh=%.3f ms success=%d\n",
+                     (long long) upto, std::chrono::duration<double, std::milli>(t1 - t0).count(),
+                     std::chrono::duration<double, std::milli>(tick() - t1).count(), ok ? 1 : 0);
+    return ok;
 }
 
 bool conversation_kv_part_sizes(const QsaState& st, const ModelGeometry& g, int64_t upto, bool index,

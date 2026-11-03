@@ -13,6 +13,7 @@
 #include <cstdlib>
 #include <limits>
 #include <vector>
+#include <tuple>
 
 using namespace strata::core;
 using namespace strata::kernels;
@@ -110,6 +111,17 @@ bool equal(const ConversationKv& a,const ConversationKv& b) {
     return a.k==b.k && a.v==b.v && a.k_scale==b.k_scale && a.v_scale==b.v_scale && a.pooled==b.pooled;
 }
 
+// Synthetic stage images must have the same exact KV directory as a fresh
+// capture without a draft. pop_back preserves spare capacity, intentionally
+// rejected by the production storage planner's fresh-RAM bound.
+void omit_synthetic_draft(SavedConversation& image) {
+    check(!image.kv.empty(), "synthetic draft exists");
+    std::vector<ConversationKv> retained(image.kv.size()-1);
+    check(retained.capacity()==retained.size(), "fresh synthetic KV directory has exact capacity");
+    for (size_t i=0; i<retained.size(); ++i) retained[i]=std::move(image.kv[i]);
+    image.kv=std::move(retained);
+}
+
 void full_session(int fmt, int mode, int experts) {
     Fixture main(fmt,mode), draft(fmt==3?kKvInt8:fmt,2);
     auto& g=main.g;
@@ -151,6 +163,126 @@ void full_session(int fmt, int mode, int experts) {
     check(a.checkpoints[0].used == 17,"upstream checkpoint LRU stamp survives capture");
     fill(177);
     check(conversation_snapshot_save(b,view,ss,g,draft.state,err),"capture complete B");
+    {
+        // The old artificial directory shape remains rejected, not normalized by
+        // production. The ordinary fresh fallback must still capture B.
+        auto spare=a;
+        spare.kv.pop_back();
+        check(spare.kv.capacity()>spare.kv.size(), "pop_back fixture retains spare directory capacity");
+        auto invalid=conversation_retired_kv(std::move(spare),0);
+        const auto before=invalid.bytes();
+        ConversationStoragePlan rejected;
+        err.clear();
+        check(!conversation_snapshot_storage_plan(invalid,view,ss,g,nullptr,rejected,err) &&
+              err=="conversation snapshot: invalid retired storage ownership/identity",
+              "spare KV directory still rejected by fresh-capacity guard");
+        check(!conversation_snapshot_storage_prepare(invalid,view,ss,g,nullptr,err) && invalid.bytes()==before,
+              "spare directory rejection preserves retired payload before trim");
+        SavedConversation fallback;
+        err.clear();
+        check(conversation_snapshot_save(fallback,view,ss,g,nullptr,err) &&
+              fallback.kv.size()+1==b.kv.size() && equal(fallback.kv[0],b.kv[0]) &&
+              fallback.live.gdn==b.live.gdn && fallback.live.dead==b.live.dead,
+              "spare directory fresh fallback still captures B");
+    }
+    // Pending native regression: identical IDs in already-superseded A do NOT
+    // justify retaining any content while capturing B. Not a CPU mock test.
+    for (int delta : {-2,0,2}) for (size_t stages = 0; stages <= 3; ++stages) {
+        auto target_ids = ids;
+        target_ids.resize(size_t(int64_t(ids.size()) + delta), 7);
+        const ConversationView target{target_ids,images,checkpoints,true};
+        SavedConversation expected;
+        check(conversation_snapshot_save(expected,target,ss,g,draft.state,err), "fresh different-extent reference");
+        SavedConversation stale = a;
+        const auto* main_draft = stages ? nullptr : &draft.state;
+        if (stages) omit_synthetic_draft(stale);
+        for (size_t k = 0; k < stages; ++k) {
+            auto part = a;
+            if (k + 1 != stages) omit_synthetic_draft(part); // draft only on last owning stage
+            stale.stage_images.push_back(std::move(part));
+        }
+        ConversationCache cache(64 << 20, 4);
+        check(cache.put(std::move(stale)), "park storage-only victim");
+        SavedConversation retired;
+        check(cache.drop_superseded(ids,images,checkpoints,true,&retired) == 1,
+              "extract only a baseline-superseded image");
+        auto reuse = conversation_retired_kv(std::move(retired), stages);
+        check(reuse.unchanged_tokens == 0 && reuse.ids.empty(), "main storage has no trusted contents");
+        auto later = std::move(reuse.stages);
+        reuse.stages.clear();
+        const uint8_t* pointer = nullptr;
+        reuse.kv[0].k.visit(0,reuse.kv[0].k.size(),[&](const uint8_t* p,size_t n,size_t){
+            if (n == ConversationBuffer::segment_bytes && !pointer) pointer=p; return true;
+        });
+        // Capture every segment/tail address, not only a first pointer. A future
+        // full-geometry run must check all original 180 allocations on delta=0.
+        std::vector<std::tuple<size_t,size_t,const uint8_t*,size_t,size_t>> pointers;
+        for (size_t i=0;i<reuse.kv.size();++i) {
+            auto& kv=reuse.kv[i];
+            std::array<ConversationBuffer*,5> parts{&kv.k,&kv.v,&kv.k_scale,&kv.v_scale,&kv.pooled};
+            for (size_t j=0;j<parts.size();++j) parts[j]->visit(0,parts[j]->size(),[&](const uint8_t* p,size_t n,size_t at){
+                pointers.emplace_back(i,j,p,n,at); return true;
+            });
+        }
+        auto operation=[&](bool ok,const char* function,size_t stage) {
+            if (!ok) std::fprintf(stderr,
+                "FAIL_CONTEXT format=%d mode=%d experts=%d delta=%d stages=%zu stage=%zu function=%s err=%s\n",
+                fmt,mode,experts,delta,stages,stage,function,err.c_str());
+            return ok;
+        };
+        ConversationStoragePlan plan;
+        check(operation(conversation_snapshot_storage_plan(reuse,target,ss,g,main_draft,plan,err), "storage_plan",0) &&
+              operation(conversation_snapshot_storage_prepare(reuse,target,ss,g,main_draft,err), "storage_prepare",0), "prepare validated retired allocation ownership");
+        if (delta==0) check(!plan.released && !plan.directory_allocation,"same-size path retains all segments/tails");
+        size_t peak=0, skipped=0;
+        check(conversation_snapshot_capture_bytes(reuse,target,ss,g,main_draft,peak,err),
+              "prevalidate prepared storage capture");
+        SavedConversation captured;
+        check(conversation_snapshot_save(captured,target,ss,g,main_draft,err,std::move(reuse),&skipped),
+              "capture full main and draft into retired storage");
+        check(skipped == 0 && captured.bytes() <= peak && equal(captured.kv[0],expected.kv[0]) &&
+              (!main_draft || equal(captured.kv.back(),expected.kv.back())), "all main/draft bytes match B, no skipped-copy accounting");
+        captured.kv[0].k.visit(0,1,[&](const uint8_t* p,size_t,size_t){
+            if (plan.kept && pointer) check(p == pointer,"full-segment storage preserves allocation"); return true;
+        });
+        if (delta==0) for (const auto& [i,j,p,n,at] : pointers) {
+            auto& kv=captured.kv[i];
+            std::array<ConversationBuffer*,5> parts{&kv.k,&kv.v,&kv.k_scale,&kv.v_scale,&kv.pooled};
+            check(parts[j]->visit(at,n,[&](const uint8_t* current,size_t count,size_t){
+                check(current==p && count==n,"same-shape every original segment and tail address retained");return true;
+            }),"retained segment range valid");
+        }
+        for (size_t stage=0;stage<later.size();++stage) {
+            auto& r=later[stage];
+            const auto* stage_draft=stage+1==later.size()?&draft.state:nullptr;
+            SavedConversation fresh_stage;
+            check(conversation_snapshot_save(fresh_stage,target,ss,g,stage_draft,err), "fresh stage reference with draft on last owner");
+            check(r.unchanged_tokens == 0 && r.ids.empty(), "all stages have no trusted contents");
+            SavedConversation part;
+            check(operation(conversation_snapshot_storage_prepare(r,target,ss,g,stage_draft,err), "storage_prepare",stage+1) &&
+                  operation(conversation_snapshot_capture_bytes(r,target,ss,g,stage_draft,peak,err), "capture_bytes",stage+1) &&
+                  operation(conversation_snapshot_save(part,target,ss,g,stage_draft,err,std::move(r),&skipped), "snapshot_save",stage+1),
+                  "capture full later stage into retired storage");
+            check(skipped == 0 && part.bytes() <= peak && equal(part.kv[0],fresh_stage.kv[0]),
+                  "all stage bytes recopied, no false skipped-copy diagnostic");
+            if (stage_draft) check(equal(part.kv.back(),fresh_stage.kv.back()),"last-stage draft fully recopied");
+        }
+        for (int fault : {0,1,2}) {
+            auto invalid = conversation_retired_kv(SavedConversation(a), 0);
+            if (fault == 0) ++invalid.kv[0].format;
+            if (fault == 1) ++invalid.kv[0].head_dim;
+            if (fault == 2) invalid.kv[0].k.pop_back();
+            SavedConversation untouched = b;
+            check(!conversation_snapshot_storage_prepare(invalid,view,ss,g,&draft.state,err),
+                  "wrong format/shape/extent rejected before trim");
+            check(!conversation_snapshot_save(untouched,view,ss,g,draft.state,err,std::move(invalid)),
+                  "invalid retired storage cannot publish partial snapshot");
+            check(equal(untouched.kv[0],b.kv[0]), "failed prevalidation preserves output");
+            err.clear();
+            check(conversation_snapshot_save(untouched,view,ss,g,draft.state,err) &&
+                  equal(untouched.kv[0],b.kv[0]), "existing fresh fallback still captures B");
+        }
+    }
     {
         // disk save path: metadata + streamed K/V give the same file as the captured image
         SavedConversation meta;
@@ -276,7 +408,7 @@ int main() {
     if (cudaGetDeviceCount(&devices)!=cudaSuccess || !devices) return 77;
     for (int fmt : std::array<int,4>{kKvF16,kKvInt8,kKvQ4,3}) for (int mode : {0,1,2}) {
         if (fmt==3 && mode!=0) continue;
-        Fixture f(fmt,mode);
+        Fixture f(fmt,mode), target(fmt,mode);
         if (fmt==3) {
             std::string err;
             ConversationKv invalid;
@@ -313,6 +445,19 @@ int main() {
             check(equal(a,restored),"A/B/A byte-exact K/V and indexer state");
             uint64_t fingerprint = 0;
             check(conversation_kv_verify(a,f.state,f.g,upto,index,fingerprint,err),"verify restored authoritative and resident bytes without rewriting them");
+            target.fill(211);
+            check(conversation_kv_copy(f.state,target.state,f.g,upto,index,err),"copy authoritative K/V directly between sessions");
+            ConversationKv direct;
+            check(conversation_kv_save(direct,target.state,target.g,upto,index,err),"capture direct-copy destination");
+            check(equal(a,direct),"direct copy equals snapshot save plus restore for every payload");
+            check(conversation_kv_verify(a,target.state,target.g,upto,index,fingerprint,err),
+                  "direct copy refreshes streamed and draft-ring residency");
+            check(!conversation_kv_copy(f.state,target.state,f.g,-1,index,err),"direct copy rejects invalid extent");
+            if (fmt==kKvInt8) {
+                target.state.kv_rot=true;
+                check(!conversation_kv_copy(f.state,target.state,f.g,upto,index,err),"direct copy rejects a different rotation layout");
+                target.state.kv_rot=false;
+            }
             {
                 // disk save streams the same bytes as a captured image, without the host copy
                 SessionKvSource src;

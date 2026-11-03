@@ -9,6 +9,8 @@
 #include <cstddef>
 #include <cstdint>
 #include <deque>
+#include <new>
+#include <string>
 #include <utility>
 #include <vector>
 
@@ -59,8 +61,15 @@ struct ConversationKvReuse {
     int64_t captured_tokens = 0, unchanged_tokens = 0;
     // With a layer split: the later stages' own retained K/V, one per stage, same extents (empty: none)
     std::vector<ConversationKvReuse> stages;
+    std::vector<int32_t> ids;
+    enum class Mode { prefix, retired_storage, prepared_storage };
+    Mode mode = Mode::prefix;
+    // Prepared storage carries allocation ownership only, never snapshot identity
+    // or old geometry. Its only extent is the new full-overwrite target.
+    int64_t prepared_tokens = 0;
     size_t bytes() const {
-        size_t n = kv.capacity() * sizeof(ConversationKv) + stages.capacity() * sizeof(ConversationKvReuse);
+        size_t n = kv.capacity() * sizeof(ConversationKv) + stages.capacity() * sizeof(ConversationKvReuse) +
+                   ids.capacity() * sizeof(int32_t);
         for (const auto& layer : kv) n += layer.bytes();
         for (const auto& s : stages) n += s.bytes();
         return n;
@@ -145,6 +154,23 @@ inline bool conversation_checkpoints_merge(ConversationCheckpointSplit&& split, 
     return true;
 }
 
+// Keep the chosen checkpoint first, then compatible shorter branch points from the slot.
+inline bool conversation_slot_checkpoints(std::vector<ConversationCheckpoint>& out,
+                                          const std::vector<ConversationCheckpoint>& source,
+                                          const std::vector<int32_t>& copied,
+                                          const ConversationCheckpoint* first = nullptr) {
+    if (first != nullptr) out.push_back(*first);
+    try {
+        for (const auto& c : source)
+            if (&c != first && c.imgs.empty() && c.ids.size() <= copied.size() &&
+                std::equal(c.ids.begin(), c.ids.end(), copied.begin()))
+                out.push_back(c);
+    } catch (const std::bad_alloc&) {
+        return false;
+    }
+    return true;
+}
+
 struct SavedConversation {
     // Runtime compatibility only; NOT a model/weights identity or disk schema.
     std::array<int64_t, 18> geometry{};
@@ -172,6 +198,68 @@ struct SavedConversation {
         return n;
     }
 };
+
+// Consume storage from an image that drop_superseded already removed. No content
+// identity survives: even identical token IDs require full writes on every stage.
+// A different stage layout is a fresh-capture miss, not a partial reuse.
+inline ConversationKvReuse conversation_retired_kv(SavedConversation retired, size_t stages) {
+    if (retired.stage_images.size() != stages || retired.kv.empty()) return {};
+    for (const auto& s : retired.stage_images)
+        if (!s.stage_images.empty() || s.live.ids != retired.live.ids || s.kv.empty()) return {};
+    ConversationKvReuse out;
+    // Allocate the small stage directory before moving payloads. On failure the
+    // already-retired image dies here; no active state or surviving cache changes.
+    out.stages.resize(stages);
+    out.mode = ConversationKvReuse::Mode::retired_storage;
+    out.captured_tokens = (int64_t) retired.live.ids.size();
+    out.kv = std::move(retired.kv);
+    for (size_t k = 0; k < stages; ++k) {
+        out.stages[k].mode = ConversationKvReuse::Mode::retired_storage;
+        out.stages[k].captured_tokens = (int64_t) retired.stage_images[k].live.ids.size();
+        out.stages[k].kv = std::move(retired.stage_images[k].kv);
+    }
+    return out;
+}
+
+// Optional retired-storage work only: never wrap ordinary prefix reuse, fresh
+// allocation/capture, or device operations in this boundary. A failed optional
+// conversion/plan/preparation must release ALL stages before fresh admission.
+// The already logically dropped image is not resurrected or replaced here.
+template<class Operation>
+bool conversation_optional_retired_storage(SavedConversation& retired, ConversationKvReuse& reuse,
+                                           std::vector<ConversationKvReuse>& stages, std::string& error,
+                                           Operation&& operation) {
+    bool valid = false;
+    try {
+        valid = std::forward<Operation>(operation)();
+    } catch (const std::bad_alloc&) {
+        // Only optional host storage OOM is a fresh-capture miss. Other
+        // exceptions retain their caller's policy and propagate unchanged.
+    }
+    if (!valid) {
+        retired = {};
+        reuse = {};
+        for (auto& stage : stages) stage = {};
+        error.clear();
+    }
+    return valid;
+}
+
+// A continuation must also contain exactly the same pictures below this prefix.
+template<class Token>
+bool conversation_covers(const ConversationCheckpoint& c, const std::vector<Token>& ids,
+                         const std::vector<ConversationImageKey>& images) {
+    const size_t n = ids.size();
+    if (n == 0 || c.ids.size() < n) return false;
+    for (size_t i = 0; i < n; ++i)
+        if ((int64_t) c.ids[i] != (int64_t) ids[i]) return false;
+    size_t j = 0;
+    for (const auto& image : c.imgs) {
+        if (image.start >= (int64_t) n) continue;
+        if (j == images.size() || !(images[j++] == image)) return false;
+    }
+    return j == images.size();
+}
 
 template<class Token>
 int64_t conversation_prefix(const ConversationCheckpoint& c, const std::vector<Token>& prompt,
@@ -218,10 +306,10 @@ public:
     // This optimization never evicts a parked conversation to make itself fit.
     // `stage_kv`: with a layer split, the later stages' restored K/V (one per stage), retained with the first's.
     void retain(std::vector<ConversationKv>&& kv, int64_t tokens,
-                std::vector<std::vector<ConversationKv>>&& stage_kv = {}) {
+                std::vector<std::vector<ConversationKv>>&& stage_kv = {}, std::vector<int32_t> ids = {}) {
         reuse_ = {};
-        ConversationKvReuse candidate{std::move(kv), tokens, tokens, {}};
-        for (auto& k : stage_kv) candidate.stages.push_back(ConversationKvReuse{std::move(k), tokens, tokens, {}});
+        ConversationKvReuse candidate{std::move(kv), tokens, tokens, {}, std::move(ids)};
+        for (auto& k : stage_kv) candidate.stages.push_back(ConversationKvReuse{std::move(k), tokens, tokens, {}, {}});
         if (enabled() && candidate.bytes() <= budget_ - bytes_) reuse_ = std::move(candidate);
     }
     void limit_reuse(int64_t first_dirty) {
@@ -230,6 +318,18 @@ public:
         if (reuse_.unchanged_tokens <= 0) reuse_ = {};
     }
     ConversationKvReuse take_reuse() { return std::exchange(reuse_, {}); }
+    template<class Token>
+    ConversationKvReuse take_reuse_for(const std::vector<Token>& live) {
+        ConversationKvReuse r = std::exchange(reuse_, {});
+        const int64_t n = std::min<int64_t>((int64_t) r.ids.size(), (int64_t) live.size());
+        int64_t same = 0;
+        while (same < n && (int64_t) r.ids[(size_t) same] == (int64_t) live[(size_t) same]) ++same;
+        r.unchanged_tokens = std::min(r.unchanged_tokens, same);
+        for (auto& stage : r.stages) stage.unchanged_tokens = std::min(stage.unchanged_tokens, same);
+        if (r.unchanged_tokens <= 0) return {};
+        std::vector<int32_t>().swap(r.ids);
+        return r;
+    }
     size_t retained_bytes() const { return reuse_.bytes(); }
     bool can_fit(size_t incoming, size_t held = 0) const {
         return enabled() && held <= budget_ && incoming <= budget_ - held &&
@@ -254,6 +354,18 @@ public:
         return best;
     }
 
+    // Read-only coverage check; do not change LRU order.
+    template<class Token>
+    bool holds(const std::vector<Token>& ids, const std::vector<ConversationImageKey>& images, bool cvec) const {
+        for (const auto& e : entries_) {
+            if (e.cvec != cvec) continue;
+            if (conversation_covers(e.live, ids, images)) return true;
+            for (const auto& c : e.checkpoints)
+                if (conversation_covers(c, ids, images)) return true;
+        }
+        return false;
+    }
+
     SavedConversation take(size_t index) {
         SavedConversation out = std::move(entries_.at(index));
         bytes_ -= out.bytes();
@@ -276,9 +388,8 @@ public:
 
     // The parked conversation that has gone unused the longest.  This is make_room()'s loop body, so
     // the parking path can also free RAM one entry at a time on demand (see the physical-RAM admission
-    // gate in generate.cpp).  A ConversationBuffer is a list of 16 MiB segments and each segment is its
-    // own allocation, far above glibc's mmap threshold, so dropping an entry returns the whole footprint
-    // to the kernel at once - the next admission check reads it back from /proc/meminfo.
+    // gate in generate.cpp). Freed segments can stay in the allocator's heap; the RAM gate must reclaim
+    // those pages before sampling again.
     // False when none can go (empty, or only entries that hold a pinned shared prefix are left).
     bool evict_oldest() {
         auto victim = std::find_if(entries_.begin(), entries_.end(), [](const SavedConversation& e) { return !e.pinned(); });
@@ -309,8 +420,12 @@ public:
     // oldest-first eviction then pushed the parent conversation out after `slots` turns.  An entry without
     // checkpoints, or whose deepest checkpoint the outgoing chain does not hold (another conversation that only
     // shares the system prompt's root with it), is kept.  Returns how many were dropped.
+    // Optionally move the first victim to caller-owned, short-lived storage. This
+    // does not change the predicate, drop order/count, or retained-cache accounting.
+    // The caller must release its metadata/unused storage before capture admission.
     size_t drop_superseded(const std::vector<int32_t>& ids, const std::vector<ConversationImageKey>& images,
-                           const std::vector<ConversationCheckpoint>& checkpoints, bool cvec) {
+                           const std::vector<ConversationCheckpoint>& checkpoints, bool cvec,
+                           SavedConversation* retired = nullptr) {
         auto held = [&](const ConversationCheckpoint& c) {
             if (c.ids == ids && c.imgs == images) return true;
             for (const auto& k : checkpoints)
@@ -324,7 +439,9 @@ public:
             for (const auto& c : e.checkpoints)
                 if (!deepest || c.ids.size() > deepest->ids.size()) deepest = &c;
             if (e.cvec == cvec && deepest && !deepest->ids.empty() && held(*deepest)) {
-                bytes_ -= e.bytes();
+                const size_t removed_bytes = e.bytes(); // capacities must be measured BEFORE the move
+                if (retired && dropped == 0) *retired = std::move(entries_[i]);
+                bytes_ -= removed_bytes;
                 entries_.erase(entries_.begin() + (std::ptrdiff_t) i);
                 ++dropped;
                 continue;
@@ -333,6 +450,25 @@ public:
         }
         superseded_ += dropped;
         return dropped;
+    }
+    // A slot must not replace a parked image with a poorer checkpoint chain.
+    bool supersedes_richer(const std::vector<int32_t>& ids, const std::vector<ConversationImageKey>& images,
+                           const std::vector<ConversationCheckpoint>& checkpoints, bool cvec) const {
+        auto held = [&](const ConversationCheckpoint& c) {
+            if (c.ids == ids && c.imgs == images) return true;
+            for (const auto& k : checkpoints)
+                if (k.ids == c.ids && k.imgs == c.imgs) return true;
+            return false;
+        };
+        for (const auto& e : entries_) {
+            const ConversationCheckpoint* deepest = nullptr;
+            for (const auto& c : e.checkpoints)
+                if (!deepest || c.ids.size() > deepest->ids.size()) deepest = &c;
+            if (e.cvec != cvec || !deepest || deepest->ids.empty() || !held(*deepest)) continue;
+            for (const auto& c : e.checkpoints)
+                if (!held(c)) return true;
+        }
+        return false;
     }
     size_t superseded() const { return superseded_; }
 

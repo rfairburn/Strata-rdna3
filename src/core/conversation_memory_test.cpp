@@ -49,6 +49,32 @@ int main() {
                                    std::numeric_limits<uint64_t>::max(), 0), "maximal exact bound");
     check(!conversation_memory_admit(std::numeric_limits<uint64_t>::max(),
                                     std::numeric_limits<uint64_t>::max(), 1), "maximal sum overflow rejected");
+    {
+        int samples = 0, reclaims = 0;
+        auto room = [&] { ++samples; return true; };
+        auto reclaim = [&] { ++reclaims; };
+        check(conversation_memory_retry(room, reclaim), "sufficient memory passes without reclaim");
+        check(samples == 1 && reclaims == 0, "normal admission does not reclaim or resample");
+    }
+    {
+        int samples = 0, reclaims = 0;
+        uint64_t room = 99;
+        auto admit = [&] { ++samples; return conversation_memory_admit(room, 40, 60); };
+        auto reclaim = [&] { ++reclaims; room = 100; };
+        check(conversation_memory_retry(admit, reclaim), "reclaim can admit a snapshot without eviction");
+        check(samples == 2 && reclaims == 1, "failed admission reclaims once and samples again");
+    }
+    {
+        int samples = 0, reclaims = 0;
+        auto admit = [&] { ++samples; return conversation_memory_admit(99, 40, 60); };
+        auto reclaim = [&] { ++reclaims; };
+        check(!conversation_memory_retry(admit, reclaim), "unsuccessful reclaim does not bypass the floor");
+        check(samples == 2 && reclaims == 1, "unsuccessful reclaim stays bounded");
+    }
+    {
+        auto unknown = [] { return conversation_memory_admit({}, 0, 0); };
+        check(!conversation_memory_retry(unknown, [] {}), "unknown memory remains fail closed after reclaim");
+    }
     // Test the real provider without assuming any particular amount of free RAM.
     const auto available = available_host_bytes();
     check(!available || conversation_memory_admit(available, 0, 0), "provider returns bytes or unknown");

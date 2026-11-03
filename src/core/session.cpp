@@ -82,7 +82,8 @@ uint64_t session_bytes(const ModelGeometry& g, int64_t max_cells, int64_t k, int
 }
 
 uint64_t session_init(const ModelGeometry& g, int64_t max_cells, int64_t k, void* base, SessionState& s,
-                      int64_t layer_lo, int64_t layer_hi, const QsaState* share_rope) {
+                      int64_t layer_lo, int64_t layer_hi, const QsaState* share_rope,
+                      const QsaState* share_host_states) {
     if (layer_hi < 0 || layer_hi > g.n_layers) layer_hi = g.n_layers;
     if (layer_lo < 0) layer_lo = 0;
     uint8_t* p = (uint8_t*) base;
@@ -122,7 +123,8 @@ uint64_t session_init(const ModelGeometry& g, int64_t max_cells, int64_t k, void
     // attention read null host pointers at the first request ("illegal memory access"), so the session fails here
     for (int64_t j = 0; j < s.qsa_alloc; ++j)
         if (qsa_state_init(g, max_cells, qp + (j == 0 ? 0 : first + (uint64_t) (j - 1) * rest),
-                           s.qsa_states[s.qsa_ord0 + j], j == 0 ? share_rope : &s.qsa_states[s.qsa_ord0]) == 0)
+                           s.qsa_states[s.qsa_ord0 + j], j == 0 ? share_rope : &s.qsa_states[s.qsa_ord0], 0,
+                           share_host_states != nullptr ? &share_host_states[s.qsa_ord0 + j].host : nullptr) == 0)
             return 0;
     qsa_buffers_init(g, max_cells, s.qsa_buf_arena, s.qsa_bufs);
 

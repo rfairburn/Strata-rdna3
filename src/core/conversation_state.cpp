@@ -4,6 +4,9 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
+#include <cstdio>
+#include <cstdlib>
 #include <limits>
 
 namespace strata::core {
@@ -30,10 +33,14 @@ bool sync(std::string& error) {
     return false;
 }
 
-bool copy(void* dst, const void* src, size_t bytes, std::string& error) {
+bool copy(void* dst, const void* src, size_t bytes, std::string& error,
+          const char* phase, const char* kind, const char* source_class, const char* target_class,
+          int64_t qsa = -1, size_t offset = 0) {
     if (!bytes) return true;
     if (!dst || !src) return fail(error, "missing running-state buffer");
-    const auto status = conversation_detail::copy_nonblocking(dst, src, bytes);
+    conversation_detail::CopyPartTrace part(phase, qsa < 0 ? "session" : "qsa", qsa, kind,
+                                            source_class, target_class, -1, -1);
+    const auto status = conversation_detail::copy_nonblocking(dst, src, bytes, &part, offset);
     if (status == cudaSuccess) return true;
     error = std::string("conversation snapshot running-state copy: ") + cudaGetErrorString(status);
     return false;
@@ -159,13 +166,18 @@ bool conversation_checkpoint_save(ConversationCheckpoint& c, const SessionState&
     const size_t layers = owned_qsa(ss);
     c.gdn.resize(z.gdn); c.ple.resize(ss.ple_hist ? z.ple : 0);
     c.tails.resize(layers * z.tail); c.dead.resize(layers * z.dead); c.block_pos.resize(layers * z.block_pos);
-    if (!copy(c.gdn.data(), ss.gdn_state, c.gdn.size(), error) ||
-        !copy(c.ple.data(), ss.ple_hist, c.ple.size(), error)) return false;
+    if (!copy(c.gdn.data(), ss.gdn_state, c.gdn.size(), error,
+              "checkpoint_capture", "GDN", "deviceState", "checkpointHost") ||
+        !copy(c.ple.data(), ss.ple_hist, c.ple.size(), error,
+              "checkpoint_capture", "PLE", "deviceState", "checkpointHost")) return false;
     for (size_t j = 0; j < layers; ++j) {
         const auto& st = owned(ss, j);
-        if (!copy(c.tails.data() + j * z.tail, st.idx_tail, z.tail, error) ||
-            !copy(c.dead.data() + j * z.dead, st.idx_dead, z.dead, error) ||
-            !copy(c.block_pos.data() + j * z.block_pos, st.idx_block_pos, z.block_pos, error)) return false;
+        if (!copy(c.tails.data() + j * z.tail, st.idx_tail, z.tail, error,
+                  "checkpoint_capture", "indexertail", "deviceindexer", "checkpointHost", ss.qsa_ord0 + j) ||
+            !copy(c.dead.data() + j * z.dead, st.idx_dead, z.dead, error,
+                  "checkpoint_capture", "indexerdead", "deviceindexer", "checkpointHost", ss.qsa_ord0 + j) ||
+            !copy(c.block_pos.data() + j * z.block_pos, st.idx_block_pos, z.block_pos, error,
+                  "checkpoint_capture", "indexerpos", "deviceindexer", "checkpointHost", ss.qsa_ord0 + j)) return false;
     }
     return true;
 }
@@ -176,16 +188,23 @@ bool conversation_checkpoint_restore(const ConversationCheckpoint& c, SessionSta
     ConversationStateSizes z;
     if (!conversation_session_sizes(g, ss, z, error)) return false;
     if (!sync(error)) return false;   // the copies below no longer ride the legacy stream's implicit ordering
-    if (!copy(ss.gdn_state, c.gdn.data(), c.gdn.size(), error) ||
-        !copy(ss.ple_hist, c.ple.data(), c.ple.size(), error)) return false;
+    if (!copy(ss.gdn_state, c.gdn.data(), c.gdn.size(), error,
+              "checkpoint_restore", "GDN", "checkpointHost", "deviceState") ||
+        !copy(ss.ple_hist, c.ple.data(), c.ple.size(), error,
+              "checkpoint_restore", "PLE", "checkpointHost", "deviceState")) return false;
     for (size_t j = 0; j < owned_qsa(ss); ++j) {
         const auto& st = owned(ss, j);
-        if (!copy(st.idx_tail, c.tails.data() + j * z.tail, z.tail, error) ||
-            !copy(st.idx_dead, c.dead.data() + j * z.dead, z.dead, error) ||
-            !copy(st.idx_block_pos, c.block_pos.data() + j * z.block_pos, z.block_pos, error)) return false;
+        if (!copy(st.idx_tail, c.tails.data() + j * z.tail, z.tail, error,
+                  "checkpoint_restore", "indexertail", "checkpointHost", "deviceindexer", ss.qsa_ord0 + j) ||
+            !copy(st.idx_dead, c.dead.data() + j * z.dead, z.dead, error,
+                  "checkpoint_restore", "indexerdead", "checkpointHost", "deviceindexer", ss.qsa_ord0 + j) ||
+            !copy(st.idx_block_pos, c.block_pos.data() + j * z.block_pos, z.block_pos, error,
+                  "checkpoint_restore", "indexerpos", "checkpointHost", "deviceindexer", ss.qsa_ord0 + j)) return false;
         if (!c.ids.empty()) {
             const size_t row = c.ids.size() / strata::kernels::qsa_real_shapes().idx_block;
-            if (!copy(st.idx_pooled + row * g.idx_key_dim, c.dead.data() + j * z.dead, z.dead, error)) return false;
+            if (!copy(st.idx_pooled + row * g.idx_key_dim, c.dead.data() + j * z.dead, z.dead, error,
+                      "checkpoint_restore", "pooledindexer", "checkpointHost", "deviceindexer", ss.qsa_ord0 + j,
+                      row * g.idx_key_dim * sizeof(float))) return false;
         }
     }
     const size_t tokens = c.ids.size();
@@ -221,22 +240,87 @@ bool conversation_snapshot_bytes(const ConversationView& view, const SessionStat
     return true;
 }
 
+bool conversation_snapshot_storage_plan(const ConversationKvReuse& reuse, const ConversationView& view,
+                                        const SessionState& ss, const ModelGeometry& g, const QsaState* draft,
+                                        ConversationStoragePlan& plan, std::string& error) {
+    plan = {};
+    if (!conversation_snapshot_bytes(view, ss, g, draft, plan.fresh, error)) return false;
+    const size_t layers = owned_qsa(ss) + (draft ? 1 : 0);
+    if (reuse.mode != ConversationKvReuse::Mode::retired_storage || reuse.unchanged_tokens ||
+        !reuse.ids.empty() || !reuse.stages.empty() || reuse.prepared_tokens ||
+        reuse.kv.size() != layers || reuse.kv.capacity() != layers)
+        return fail(error, "invalid retired storage ownership/identity");
+    // First validate every old layer at its OLD extent, against current targets.
+    // A malformed late/draft layer cannot cause even an earlier trim.
+    for (size_t i = 0; i < layers; ++i) {
+        const bool index = i < owned_qsa(ss);
+        if (!conversation_kv_validate(reuse.kv[i], index ? owned(ss, i) : *draft, g,
+                                      reuse.captured_tokens, index, error)) return false;
+    }
+    plan.preparation_peak = plan.fresh;
+    for (size_t i = 0; i < layers; ++i) {
+        const bool index = i < owned_qsa(ss);
+        std::array<uint64_t, 5> sizes{};
+        if (!conversation_kv_part_sizes(index ? owned(ss, i) : *draft, g, int64_t(view.ids.size()), index, sizes, error)) return false;
+        const auto& k = reuse.kv[i];
+        const std::array<const ConversationBuffer*,5> buffers{&k.k, &k.v, &k.k_scale, &k.v_scale, &k.pooled};
+        for (size_t j = 0; j < buffers.size(); ++j) {
+            const auto p = buffers[j]->overwrite_plan(sizes[j]);
+            if (p.fresh > plan.preparation_peak) return fail(error, "retired storage peak underflow");
+            plan.preparation_peak -= p.fresh;
+            if (!add(plan.preparation_peak, p.preparation_peak)) return fail(error, "retired storage peak overflow");
+            if (!p.fits || p.preparation_peak > p.fresh ||
+                !add(plan.kept, p.kept) || !add(plan.kept_full, p.kept_full) || !add(plan.released, p.released) ||
+                !add(plan.directory_allocation, p.directory_allocation))
+                return fail(error, "retired storage directory peak exceeds fresh or overflows");
+        }
+    }
+    return true;
+}
+
+bool conversation_snapshot_storage_prepare(ConversationKvReuse& reuse, const ConversationView& view,
+                                           const SessionState& ss, const ModelGeometry& g, const QsaState* draft,
+                                           std::string& error) {
+    ConversationStoragePlan plan;
+    if (!conversation_snapshot_storage_plan(reuse, view, ss, g, draft, plan, error)) return false;
+    for (size_t i = 0; i < reuse.kv.size(); ++i) {
+        const bool index = i < owned_qsa(ss);
+        std::array<uint64_t,5> sizes{};
+        if (!conversation_kv_part_sizes(index ? owned(ss, i) : *draft, g, int64_t(view.ids.size()), index, sizes, error)) return false;
+        auto& k = reuse.kv[i];
+        const std::array<ConversationBuffer*,5> buffers{&k.k, &k.v, &k.k_scale, &k.v_scale, &k.pooled};
+        for (size_t j = 0; j < buffers.size(); ++j)
+            if (!buffers[j]->prepare_overwrite(sizes[j])) return fail(error, "retired storage directory allocation mismatch");
+        // Only allocation ownership remains. Do not label it as a valid snapshot.
+        k.format = 0; k.cells = k.heads = k.head_dim = k.page_size = k.pooled_rows = k.idx_dim = 0;
+    }
+    reuse.mode = ConversationKvReuse::Mode::prepared_storage;
+    reuse.captured_tokens = 0;
+    reuse.prepared_tokens = int64_t(view.ids.size());
+    return true;
+}
+
 bool conversation_snapshot_capture_bytes(const ConversationKvReuse& reuse, const ConversationView& view,
                                          const SessionState& ss, const ModelGeometry& g,
                                          const QsaState* draft, size_t& bytes, std::string& error) {
     if (!conversation_snapshot_bytes(view, ss, g, draft, bytes, error)) return false;
-    if (reuse.kv.empty()) return true;
+    const bool storage = reuse.mode == ConversationKvReuse::Mode::prepared_storage;
+    if (reuse.mode == ConversationKvReuse::Mode::retired_storage ||
+        (storage && (reuse.unchanged_tokens || !reuse.ids.empty() || !reuse.stages.empty() ||
+                     reuse.captured_tokens || reuse.prepared_tokens != int64_t(view.ids.size()))))
+        return fail(error, "unprepared storage or nonzero storage identity/prefix");
+    if (reuse.kv.empty()) return !storage || fail(error, "missing prepared storage");
     const size_t layers = owned_qsa(ss) + (draft ? 1 : 0);
-    if (reuse.kv.size() != layers || reuse.unchanged_tokens < 0 ||
+    if (reuse.kv.size() != layers || (storage && reuse.kv.capacity() != layers) || reuse.unchanged_tokens < 0 ||
         reuse.unchanged_tokens > reuse.captured_tokens || reuse.unchanged_tokens > int64_t(view.ids.size()))
         return fail(error, "invalid retained K/V prefix");
     for (size_t i = 0; i < layers; ++i) {
         const bool index = i < owned_qsa(ss);
         const auto& st = index ? owned(ss, i) : *draft;
-        if (!conversation_kv_validate(reuse.kv[i], st, g, reuse.captured_tokens, index, error)) return false;
+        if (!storage && !conversation_kv_validate(reuse.kv[i], st, g, reuse.captured_tokens, index, error)) return false;
         const size_t fresh = conversation_kv_bytes(st, g, int64_t(view.ids.size()), index);
         size_t retained = 0;
-        if (!conversation_kv_capture_bytes(reuse.kv[i], st, g, int64_t(view.ids.size()), index, retained, error)) return false;
+        if (!conversation_kv_capture_bytes(reuse.kv[i], st, g, int64_t(view.ids.size()), index, retained, error, storage)) return false;
         bytes -= fresh;
         if (!add(bytes, retained)) return fail(error, "retained K/V allocation overflow");
     }
@@ -250,28 +334,42 @@ bool conversation_snapshot_save(SavedConversation& image, const ConversationView
                                 const SessionState& ss, const ModelGeometry& g,
                                 const QsaState* draft, std::string& error,
                                 ConversationKvReuse reuse, size_t* reused_bytes) {
+    static const bool trace = std::getenv("STRATA_PARK_TRACE") != nullptr;
+    auto tick = [] { return trace ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{}; };
+    auto ms = [](auto a, auto b) { return std::chrono::duration<double, std::milli>(b - a).count(); };
+    const auto t0 = tick();
     size_t estimate = 0;
     if (!conversation_snapshot_capture_bytes(reuse, view, ss, g, draft, estimate, error) || !sync(error)) return false;
+    const auto t1 = tick();
     // Build into a new object so a failure cannot publish a partial snapshot.
     SavedConversation captured;
     captured.geometry = geometry_key(g);
     captured.layer_lo = ss.layer_lo; captured.layer_hi = ss.layer_hi;
     captured.live.ids = view.ids; captured.live.imgs = view.images;
     captured.cvec = view.cvec; captured.checkpoints = view.checkpoints;
+    const auto t2 = tick();
+    const bool storage = reuse.mode == ConversationKvReuse::Mode::prepared_storage;
     const int64_t unchanged = reuse.kv.empty() ? 0 : reuse.unchanged_tokens;
     captured.kv = std::move(reuse.kv);
     const size_t layers = owned_qsa(ss);
     captured.kv.resize(layers + (draft ? 1 : 0));
+    const auto t3 = tick();
     if (!conversation_checkpoint_save(captured.live, ss, g, error)) return false;
+    const auto t4 = tick();
     const int64_t upto = (int64_t) view.ids.size();
     for (size_t j = 0; j < layers; ++j)
         if (!conversation_kv_save(captured.kv[j], owned(ss, j), g, upto, true, error,
-                                  unchanged, reused_bytes)) return false;
+                                  unchanged, reused_bytes, ss.qsa_ord0 + j, storage)) return false;
     // The draft's final cell may not have been computed when the output cap was
     // reached. Refresh that page even when the main prefix continued unchanged.
     if (draft && !conversation_kv_save(captured.kv.back(), *draft, g, upto, false, error,
-                                       std::max<int64_t>(0, unchanged - 1), reused_bytes)) return false;
+                                       std::max<int64_t>(0, unchanged - 1), reused_bytes, -1, storage)) return false;
+    const auto t5 = tick();
     image = std::move(captured);
+    if (trace)
+        std::fprintf(stderr, "strata parktrace: snapshot tokens=%zu validate_sync=%.3f ms checkpoint_clone=%.3f ms "
+                             "kv_directory=%.3f ms live_state_save=%.3f ms kv_save=%.3f ms\n",
+                     view.ids.size(), ms(t0, t1), ms(t1, t2), ms(t2, t3), ms(t3, t4), ms(t4, t5));
     return true;
 }
 
@@ -351,9 +449,9 @@ ConversationRestore conversation_snapshot_restore(const SavedConversation& image
     if (!sync(error)) return ConversationRestore::transfer_failed;
     const int64_t upto = (int64_t) image.live.ids.size();
     for (size_t j = 0; j < owned_qsa(ss); ++j)
-        if (!conversation_kv_restore(image.kv[j], owned(ss, j), g, upto, true, error))
+        if (!conversation_kv_restore(image.kv[j], owned(ss, j), g, upto, true, error, ss.qsa_ord0 + j))
             return ConversationRestore::transfer_failed;
-    if ((draft && !conversation_kv_restore(image.kv.back(), *draft, g, upto, false, error)) ||
+    if ((draft && !conversation_kv_restore(image.kv.back(), *draft, g, upto, false, error, -1)) ||
         !conversation_checkpoint_restore(image.live, ss, g, error)) return ConversationRestore::transfer_failed;
     return ConversationRestore::restored;
 }

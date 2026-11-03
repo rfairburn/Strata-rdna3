@@ -4,6 +4,9 @@
 #include <atomic>
 #include <cstdio>
 #include <charconv>
+#include <chrono>
+#include <cstdlib>
+#include <ctime>
 #include <filesystem>
 #include <fstream>
 #include <limits>
@@ -11,6 +14,10 @@
 #include <string>
 #include <system_error>
 #include <vector>
+
+#if defined(__GLIBC__)
+#include <malloc.h>
+#endif
 
 #if defined(_WIN32)
 #ifndef NOMINMAX
@@ -288,6 +295,27 @@ std::optional<HostMemoryReading> sample_host_memory() {
     return sample_host_memory(MemoryProbePaths{}, memory_limit_bytes());
 #else
     return {};
+#endif
+}
+
+void reclaim_host_memory() {
+#if defined(__GLIBC__)
+    static const bool trace = std::getenv("STRATA_PARK_TRACE") != nullptr;
+    if (!trace) { (void) malloc_trim(0); return; }
+    const auto start = std::chrono::steady_clock::now();
+    double cpu_ms = -1;
+#if defined(__linux__)
+    timespec cpu0{}, cpu1{};
+    const bool have_cpu = clock_gettime(CLOCK_THREAD_CPUTIME_ID, &cpu0) == 0;
+#endif
+    const int released = malloc_trim(0);
+    const auto end = std::chrono::steady_clock::now();
+#if defined(__linux__)
+    if (have_cpu && clock_gettime(CLOCK_THREAD_CPUTIME_ID, &cpu1) == 0)
+        cpu_ms = (cpu1.tv_sec - cpu0.tv_sec) * 1000.0 + (cpu1.tv_nsec - cpu0.tv_nsec) / 1000000.0;
+#endif
+    std::fprintf(stderr, "strata parktrace: reclaim wall=%.3f ms thread_cpu=%.3f ms release_reported=%d\n",
+                 std::chrono::duration<double, std::milli>(end - start).count(), cpu_ms, released);
 #endif
 }
 
