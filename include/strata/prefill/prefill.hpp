@@ -15,6 +15,7 @@
 #include "strata/core/layer.hpp"
 #include "strata/core/session.hpp"
 #include "strata/core/weights.hpp"
+#include "strata/prefill/dp_plan.hpp"
 
 #include <cstdint>
 #include <functional>
@@ -290,6 +291,9 @@ public:
     static bool run_dp(Prefill& a, Prefill& b, const int64_t* tokens, int64_t n, int64_t pos0, int64_t chunk,
                        int64_t min_last, std::string& err);
     static std::shared_ptr<DpLink> make_dp_link(int n_layers, int dev_a, int dev_b, std::string& err);
+    static std::shared_ptr<DpLink> make_dp_link(int n_layers, const std::vector<int>& devices, std::string& err);
+    static bool run_dp(const std::vector<Prefill*>& paths, const int64_t* tokens, int64_t n, int64_t pos0,
+                       int64_t chunk, int64_t min_last, std::string& err);
 
     /// [claude] TENSOR-PARALLEL prompt path (STRATA_TP_PREFILL=1, docs/STRATA_TP_PREFILL_DESIGN_20261101.txt).  The two DP
     /// paths (set_dp, the same link and foreign sessions) read the SAME chunks together, every layer on both GPUs: each
@@ -329,7 +333,7 @@ private:
     bool dp_foreign_shared_ = false;   // [claude] set_dp_foreign_shared
     std::shared_ptr<DpLink> dp_link_;
     int dp_index_ = 0;
-    struct DpChunk { int64_t c0, T, k; int who; };
+    using DpChunk = dp::Chunk;
   public:
     /// [claude] the DP read in flight (or the last one): the first position of its last chunk (the second path's); every
     /// position before it is final once the first path is done (on_dp_done).  -1: no DP read yet
@@ -351,6 +355,7 @@ private:
                                                                                           // (for chunk `want`, -1: this one)
     bool tp_send(int64_t l, int x, void* dst, const void* src, size_t bytes, std::string& err);
     bool tp_gdn_back(std::string& err);                                  // each GDN layer's other head half to its owner
+    bool dp_copy_layer(Prefill& target, int64_t l, int64_t p0, int64_t T, std::string& err);
     bool dp_publish(int64_t l, int64_t k, int64_t p0, int64_t T, std::string& err);
     std::vector<int> tap_layers_;
     int64_t tap_first_ = 0, tap_cap_ = 0;

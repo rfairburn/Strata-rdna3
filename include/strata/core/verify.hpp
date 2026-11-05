@@ -34,6 +34,7 @@
 #include <chrono>
 #include <functional>
 #include <map>
+#include <set>
 #include <cstdint>
 #include <string>
 #include <vector>
@@ -247,6 +248,23 @@ public:
     /// for its doorbell, #31); batch_poll then makes no CUDA call before every layer is served.
     int batch_serve(PoolMultiFn pool, void* user);
     void set_external_serve(bool on) { ext_serve_.store(on, std::memory_order_release); }
+    // ---- STRATA_PIPED_MTP: the pipelined groups with --batch-mtp's drafts.  A group's window holds its slot's token
+    // and its drafts, so how many rows to keep is known only once the LAST stage has picked - and by then this stage
+    // runs another group's window, which reuses the scratch the commit replays from.  So right behind the window a
+    // save graph copies those rows (each GDN layer's conv and recurrence inputs, each QSA layer's raw indexer keys, the
+    // PLE history snapshot) to the group's own rows [hbase, hbase + S) of the saved buffers, and the commit, queued
+    // after the verdict, replays from there.  Everything else the commit reads is per slot already.
+    /// The saved buffers for `rows` hand-off rows (after init_slots).
+    bool init_deferred_commit(int rows, std::string& err);
+    bool deferred_commit_on() const { return dc_rows_ > 0; }
+    /// The window over the slots `rows` (a slot's rows contiguous) at hand-off rows [hbase, hbase + S), its save right
+    /// behind it, and no commit (batch_commit_rows, after the verdict).  The PLE history advances at the commit.
+    bool batch_launch_rows(const int* rows, int S, int hbase, const int32_t* tokens, const int64_t* pos,
+                           std::string& err);
+    /// Queue the commit of that window's accepted prefixes on this stage's stream (no host wait): `keep` per slot ID,
+    /// 1..the slot's rows.  `rows`, `S`, `hbase`, `tokens` and `pos` are the window's, as batch_launch_rows got them.
+    bool batch_commit_rows(const int* rows, int S, int hbase, const int* keep, const int32_t* tokens,
+                           const int64_t* pos, std::string& err);
     /// A slot's sampling (temperature / top_p / top_k / min_p / seed; penalties are not applied in batch windows):
     /// its row is drawn again on the last stage with Philox(seed, position), as a solo window draws it.  Greedy by
     /// default.  Set on the first stage, it reaches the last.
@@ -441,7 +459,7 @@ private:
     std::map<std::vector<int>, cudaGraphExec_t> exec_bm_, commit_bm_;   ///< full row layout avoids slot-ID collisions
     std::map<std::vector<int>, uint64_t> bm_used_;   ///< last use of each captured layout (LRU)
     uint64_t bm_tick_ = 0;
-    size_t batch_graph_limit_ = 0;         ///< 0: keep every captured batch graph (0.1.39); N: LRU-evict beyond N layouts
+    size_t batch_graph_limit_ = 0;         ///< 0: keep every layout; N: LRU bound, except layouts awaiting a verdict
     int last_rows_[8] = {};                ///< the slots of the last batch window's rows
     std::vector<int> bkey(const int* rows, int S, int hbase) const {   // #871: the doorbell variant has its own graphs
         std::vector<int> k = batch_key(rows, S, hbase);
@@ -480,7 +498,23 @@ private:
     void* arena_b_ = nullptr;
     int64_t last_pos_b_[8] = {};
     bool capture_batch(const int* rows, int S, int hbase, std::string& err);
-    /// Free the graph pair of the least recently used batch layout other than `keep` (`evicted`: there was one).
+    // STRATA_PIPED_MTP (init_deferred_commit): the saved rows, laid out as the window scratch (global layer index) with
+    // dc_rows_ rows per layer instead of max_t_; the slots' accepted prefixes (mapped and device, 2 + max_t_ per slot)
+    int dc_rows_ = 0;
+    bool staging_deferred_ = false;   ///< stage_batch for batch_launch_rows: no capture_commit_batch
+    float *dc_qkv_ = nullptr, *dc_h_ = nullptr, *dc_gate_ = nullptr, *dc_beta_ = nullptr, *dc_idx_ = nullptr;
+    float* dc_hist_ = nullptr;
+    void* dc_arena_ = nullptr;
+    int32_t *h_commitd_ = nullptr, *m_commitd_ = nullptr, *commitd_ = nullptr;
+    std::map<std::vector<int>, cudaGraphExec_t> save_bm_, dcommit_bm_;
+    // Window identity -> captured layout (including its doorbell variant). A later window may change ar_off_.
+    // Keep all variants of a pending layout alive until its verdict's commit is queued on cs_.
+    std::map<std::vector<int>, std::vector<int>> pending_bm_;
+    bool capture_deferred(const int* rows, int S, int hbase, std::string& err);
+    bool batch_graph_pending(const std::vector<int>& key) const;
+    std::set<std::vector<int>> batch_graph_keys() const;
+    bool trim_batch_graphs(const std::vector<int>& keep, std::string& err);
+    /// Free all graph variants of the oldest eligible layout, excluding `keep` and pending verdicts.
     bool evict_batch_graph(const std::vector<int>& keep, bool& evicted, std::string& err);
     /// cudaGraphInstantiate; out of VRAM, batch layouts other than `key` are evicted (LRU) until it fits.
     bool instantiate_evicting(cudaGraphExec_t& ex, cudaGraph_t graph, const std::vector<int>& key, const char* what,

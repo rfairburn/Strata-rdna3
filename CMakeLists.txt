@@ -146,6 +146,39 @@ if(STRATA_BUILD_CONVERSATION_TESTS)
   add_test(NAME session_save_reclaim_test COMMAND session_save_reclaim_test)
 endif()
 
+# Small, GPU-free regression fixtures. No GPU runtime or model is linked.
+option(STRATA_BUILD_DP_TESTS "Build standalone DP planner and fake-runtime ownership tests" OFF)
+if(STRATA_BUILD_DP_TESTS)
+  enable_testing()
+  find_package(Python3 REQUIRED COMPONENTS Interpreter)
+  add_executable(piped_mtp_groups_test src/program/piped_mtp_groups_test.cpp)
+  target_include_directories(piped_mtp_groups_test PRIVATE include)
+  add_test(NAME piped_mtp_groups_test COMMAND piped_mtp_groups_test)
+  add_executable(dp_plan_test src/prefill/dp_plan_test.cpp)
+  target_include_directories(dp_plan_test PRIVATE include)
+  add_test(NAME dp_plan_test COMMAND dp_plan_test)
+  set(_dp_fixture ${CMAKE_CURRENT_BINARY_DIR}/dp_port_fixture.cpp)
+  add_custom_command(OUTPUT ${_dp_fixture}
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/core/dp_port_test.py ${_dp_fixture}
+    DEPENDS tests/core/dp_port_test.py src/prefill/prefill.cpp src/core/layer.cpp src/core/mtp.cpp
+            src/core/session.cpp src/program/generate.cpp
+    VERBATIM)
+  add_executable(dp_port_test ${_dp_fixture})
+  target_include_directories(dp_port_test PRIVATE include)
+  find_package(Threads REQUIRED)
+  target_link_libraries(dp_port_test PRIVATE Threads::Threads)
+  add_test(NAME dp_port_test COMMAND dp_port_test)
+  set(_deferred_fixture ${CMAKE_CURRENT_BINARY_DIR}/deferred_graph_fixture.cpp)
+  add_custom_command(OUTPUT ${_deferred_fixture}
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/core/deferred_graph_test.py ${_deferred_fixture}
+    DEPENDS tests/core/deferred_graph_test.py src/core/verify.cpp include/strata/core/verify.hpp
+    VERBATIM)
+  add_executable(deferred_graph_test ${_deferred_fixture})
+  add_test(NAME deferred_graph_test COMMAND deferred_graph_test)
+  set_tests_properties(dp_plan_test dp_port_test deferred_graph_test PROPERTIES TIMEOUT 30)
+endif()
+
+
 if(STRATA_HIP_GFX906)
   if(NOT DEFINED CMAKE_HIP_ARCHITECTURES)
     set(CMAKE_HIP_ARCHITECTURES gfx906 CACHE STRING "HIP architectures" FORCE)

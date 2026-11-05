@@ -83,6 +83,7 @@ from serve import lifeline  # noqa: E402
 from serve.structured import StructuredOutputError, prepare_format, validated_json  # noqa: E402
 from serve import responses as responses_api  # noqa: E402
 from serve.responses import ResponsesError, error_body as responses_error_body  # noqa: E402
+from serve.idle_power import gpu_work  # noqa: E402
 from serve import images as images_api  # noqa: E402
 
 IM_END = "<|im_end|>"
@@ -1613,10 +1614,13 @@ class StrataEngine:
         q, busy, held = self.slot_q[slot], self.slot_busy, self.slot_held   # this process's: restart() replaces them
         releasing = self.slot_releasing
         releasing.add(slot)
+        power = getattr(self, "idle_power", None)
+        power_held = power.acquire() if power is not None else False
 
-        def wait():
+        def drain():
             end = time.monotonic() + 600.0
             tail = list(stream or [])
+            finished = False
             while time.monotonic() < end:
                 try:
                     line = q.get(timeout=5.0)
@@ -1624,6 +1628,7 @@ class StrataEngine:
                     continue
                 if line is None:
                     tail = []
+                    finished = True
                     break
                 if line.startswith("BT "):
                     try:
@@ -1633,13 +1638,34 @@ class StrataEngine:
                 if line.startswith("BDONE "):
                     if line.split()[3:4] == ["nonfinite"]:   # #879: the engine dropped the slot's state
                         tail = []
+                    finished = True
                     break
             held[slot] = tail[:-1] if stream and tail else []
             with self.slot_cv:
                 busy[slot] = False
                 releasing.discard(slot)
                 self.slot_cv.notify_all()
-        threading.Thread(target=wait, daemon=True).start()
+            return finished
+
+        def wait():
+            try:
+                if not drain() and power is not None:
+                    power.inhibit("native cancellation did not acknowledge completion")
+            except Exception:
+                if power is not None:
+                    power.inhibit("native cancellation cleanup failed")
+                raise
+            finally:
+                if power_held:
+                    power.release()
+        try:
+            threading.Thread(target=wait, daemon=True).start()
+        except Exception:
+            if power is not None:
+                power.inhibit("native cancellation drain could not start")
+            if power_held:
+                power.release()
+            raise
 
     BGEN_REFUSALS_MAX = 6    # #1994: how often one request tries another slot after the engine refused a BGEN
     SLOT_PARK_S = 2.0        # ... and how long a refused slot stays out of the picks
@@ -3847,6 +3873,7 @@ class Service:
         self.shared_path = None                       # where they are kept between starts (next to the config)
         self.config_effort = None                     # #1641: the config's "reasoning_effort": the level for requests with none
         self.keep_awake = None                        # #1727 (opt-in): serve.keepawake.KeepAwake, the config's "prevent_sleep"
+        self.idle_power = None
         self.fifo = threading.Lock()
         self.slot_save_path = None                    # --slot-save-path: /slots/0?action=save|restore (off when None)
         self.embeddings = threading.local()           # the current request's image embeddings file (GENI)
@@ -3930,6 +3957,7 @@ class Service:
         self.repeat_stop_tokens = REPEAT_STOP_TOKENS     # #606: one token this many times in a row ends a reply (0: off)
         self.anthropic_think_unasked = True               # #278: "anthropic_thinking": "on_request" -> False
         self.tool_call_recovery = False                   # opt-in: tool calls in forms next to the template's
+        self.tool_call_passthrough = False                # the client rejects unknown tool names
         self.images = None                                # serve/images.py's ImageGen when the config has "images"
         self.restore_after_load = None                    # a session file an image job saved before it unloaded
         self.stop_ids = set(tokenizer.encode(IM_END, parse_special=True) +
@@ -3969,6 +3997,29 @@ class Service:
 
     def loaded(self) -> bool:
         return not hasattr(self.engine, "alive") or self.engine.alive()
+
+    def set_idle_power(self, power):
+        self.idle_power = power
+        if power is not None:
+            if isinstance(self.engine, StrataEngine):
+                self.engine.idle_power = power
+            power.owner = lambda: getattr(getattr(self.engine, "proc", None), "pid", None)
+            power.busy = self.power_busy
+
+    def power_busy(self):
+        from serve.idle_power import engine_busy
+        with self.status_lock:
+            if (self.status.get("busy") or self.status.get("queued") or self.live_reqs
+                    or self.admission_reserved or self.draining):
+                return True
+        return engine_busy(self.engine)
+
+    def power_request(self, path):
+        paths = {"/load", "/unload", "/v1/load", "/v1/unload", "/v1/vram", "/v1/chat/completions",
+                 "/v1/messages", "/v1/responses", "/v1/messages/count_tokens", "/v1/images/generations"}
+        if self.idle_power is not None and (path in paths or path.startswith("/slots/")):
+            return self.idle_power.activity()
+        return contextlib.nullcontext()
 
     def admission_limit(self) -> int | None:
         if self.max_queue is None:
@@ -4065,6 +4116,7 @@ class Service:
             cancel.set()
         return len(active)
 
+    @gpu_work
     def slot_action(self, slot: str, action: str, filename) -> tuple[int, dict]:
         """llama-server's POST /slots/{id}?action=save|restore {"filename": ...}: the conversation the engine holds,
         to or from a file in slot_save_path.  -> (HTTP status, body)."""
@@ -4193,6 +4245,7 @@ class Service:
         started with, a segment or more below the size it had)."""
         return self.vram_reserve if self.vram_reserve_asked else 0
 
+    @gpu_work
     def _vision_up(self):
         """The image turn's start for an elastic encoder that is not running (the caller holds self.fifo): the expert
         cache first keeps the encoder's elastic_mib of VRAM free on top of the reserve, then the encoder starts (load and
@@ -4229,6 +4282,8 @@ class Service:
             return "busy"
         if not self.fifo.acquire(blocking=False):
             return "busy"
+        power = self.idle_power
+        power_held = power.acquire() if power is not None else False
         try:
             v.unload()
             if self.vision_held and hasattr(self.engine, "vram") and self.loaded():
@@ -4240,6 +4295,8 @@ class Service:
             return "down"
         finally:
             self.fifo.release()
+            if power_held:
+                power.release()
 
     def start_vision_idle(self):
         v = self.vision
@@ -4272,6 +4329,7 @@ class Service:
         except Exception:
             return None
 
+    @gpu_work
     def ensure_loaded(self):
         """Start the engine if it is not running (unloaded, or it died - issue #27), after the before_load hook and
         the free-VRAM check.  The caller holds self.fifo."""
@@ -4363,6 +4421,7 @@ class Service:
 
     vram_wait_s = 300.0                                  # #533: how long POST /v1/vram waits for a running request
 
+    @gpu_work
     def vram(self, reserve_mib: int | None) -> dict:
         """#533, POST /v1/vram: keep `reserve_mib` of VRAM free for other programs (None: the reserve the engine
         started with), applied between requests - a request that is running finishes first (up to wait_s).  Only an
@@ -4401,6 +4460,7 @@ class Service:
         print(f"[strata] {e}. {note} The next request starts the engine again."
               f"{' Its log: ' + log if log else ''}", flush=True)
 
+    @gpu_work
     def load(self):
         """POST /load and every generation request: start the engine now if it is unloaded (raises GpuBusy)."""
         # a request is on its way: the idle thread must not unload between this and the request's own start
@@ -4446,6 +4506,7 @@ class Service:
                 return r
             time.sleep(0.25)
 
+    @gpu_work
     def unload(self, idle_for: float | None = None) -> str:
         """Stop the engine between requests: "unloaded", "not loaded", "busy" (a request is running or waiting, or
         with idle_for: one ran more recently than that) or "unsupported"."""
@@ -4829,6 +4890,7 @@ class Service:
             self.prompts.forget(ids)
 
 
+    @gpu_work
     def prepare(self, messages, tools, kwargs, max_new=None, force=None, req=None, cancel=None):
         """-> (ids, thinking, max_new). An unset or non-positive max_new (some clients send -1) means "unlimited":
         the rest of the context.  `force` (forced_call): without thinking the reply starts with it, so it ends the
@@ -5078,13 +5140,19 @@ class Service:
             declared_only=False) -> Iterator[tuple[str, object]]:
         """The request's events (see _run); with "prevent_sleep" in the config, the PC stays awake while it runs or waits."""
         ka = self.keep_awake
-        if ka is not None:
-            ka.acquire()
+        power = self.idle_power
+        power_held = power.acquire() if power is not None else False
         try:
-            yield from self._run(ids, thinking, tools, max_new, sampling, cancel, force, declared_only)
-        finally:
             if ka is not None:
-                ka.release()
+                ka.acquire()
+            try:
+                yield from self._run(ids, thinking, tools, max_new, sampling, cancel, force, declared_only)
+            finally:
+                if ka is not None:
+                    ka.release()
+        finally:
+            if power_held:
+                power.release()
 
     def _run(self, ids, thinking, tools, max_new, sampling, cancel, force=None,
              declared_only=False) -> Iterator[tuple[str, object]]:
@@ -5123,8 +5191,9 @@ class Service:
                 print(f"[strata] thinking capped at {max_new - reserve} of max_tokens {max_new} to leave room for "
                       f"the answer (budget {budget})", flush=True)
                 budget = max(1, max_new - reserve)
-        parser = self.parser_cls(thinking=thinking, tools=tools, stream_tools=True, recover=self.tool_call_recovery,
-                                 declared_only=declared_only)
+        parser = self.parser_cls(thinking=thinking, tools=tools, stream_tools=True,
+                                 recover=self.tool_call_recovery, declared_only=declared_only,
+                                 tool_call_passthrough=self.tool_call_passthrough)
         detok, n, finish = Detokenizer(self.tok), 0, "length"
         run_tok, run_len, repeated = None, 0, False     # #606: the current run of one repeated token
         thinking_n = 0                                  # tokens written while thinking (Responses' reasoning_tokens)
@@ -5861,7 +5930,10 @@ def openai_chunks(svc: Service, req: dict, ids, thinking, tools, max_new, cancel
     calls = 0
     streamed = {}                                  # tool call id -> index, for calls sent piece by piece
     finished = set()                               # ... and the ones whose final tool_call came (#211)
-    for kind, x in run if run is not None else svc.run(ids, thinking, tools, max_new, req, cancel, force=force, declared_only=True):
+    # Only Chat augments output parsing from its raw history; MCP supplies its own unextended run.
+    generation = run if run is not None else svc.run(ids, thinking, with_history_tools(tools, req), max_new,
+                                                   req, cancel, force=force, declared_only=True)
+    for kind, x in generation:
         if kind == "ping":
             # a PP line: the prompt is being read and there is nothing to say yet.  It used to be only the SSE comment;
             # now it carries the progress when the client asked, and stays the comment when there is nothing to report.
@@ -6735,6 +6807,13 @@ def make_handler(svc: Service):
             path = V1_V1_ALIASES.get(path, path)         # an Anthropic client given ".../v1" as its base posts /v1/v1/messages
             if path.startswith("/v1/") and self._foreign_page():
                 return
+            # Management methods hold their own leases, after their existing security checks.
+            inference = path in ("/v1/chat/completions", "/v1/messages", "/v1/responses",
+                                 "/v1/messages/count_tokens", "/v1/images/generations")
+            with svc.power_request(path) if inference else contextlib.nullcontext():
+                return self._post_dispatch(path)
+
+        def _post_dispatch(self, path):
             if path == "/settings":
                 self._settings()
                 return
@@ -7465,6 +7544,9 @@ class Server(ThreadingHTTPServer):
         tel = getattr(getattr(self, "svc", None), "telemetry", None)
         if tel is not None and hasattr(tel, "close"):
             tel.close()
+        power = getattr(getattr(self, "svc", None), "idle_power", None)
+        if power is not None:
+            power.close()
         super().server_close()
 
 
@@ -8132,6 +8214,34 @@ def _component_exe(reference: str, cfg: dict) -> str:
         raise SystemExit(e.exit_code) from None
 
 
+def with_history_tools(tools, req) -> list:
+    """Include names called earlier in this conversation for output parsing only."""
+    if not tools or not isinstance(req, dict):
+        return tools
+    try:
+        have = {t.get("name") for t in tools if isinstance(t, dict)}
+        extra = []
+        for message in req.get("messages") or []:
+            if not isinstance(message, dict) or message.get("role") != "assistant":
+                continue
+            for call in message.get("tool_calls") or []:
+                name = (call.get("function") or {}).get("name") if isinstance(call, dict) else None
+                if isinstance(name, str) and name and name not in have:
+                    have.add(name)
+                    extra.append({"name": name, "parameters": {"type": "object", "properties": {}}})
+        return [*tools, *extra] if extra else tools
+    except Exception:
+        return tools
+
+
+def tool_call_passthrough_setting(cfg: dict) -> bool:
+    """Only an explicit true enables forwarding undeclared calls with normal streaming."""
+    passthrough = cfg.get("tool_call_passthrough", False)
+    if not isinstance(passthrough, bool):
+        raise SystemExit(f"[strata] config \"tool_call_passthrough\" must be true or false, not {passthrough!r}")
+    return passthrough
+
+
 def main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> int:
     try:                                               # files made by a run as administrator still belong to the user
         from strata_control import private_files as _pf
@@ -8353,6 +8463,15 @@ def main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> in
             blocked = []
         if blocked:
             ap.error("--offline cannot be strict for this profile: " + "; ".join(blocked))
+    power, startup_power_held = None, False
+    if cfg.get("idle_power") is not None and cfg.get("idle_power") is not False:
+        import atexit
+        from serve.idle_power import create
+        power = create(cfg["idle_power"], cfg.get("backend") if a.engine == "strata" else None,
+                       owner=lambda: None, busy=lambda: True, offline=a.offline)
+        if power is not None:
+            atexit.register(power.close)
+            startup_power_held = power.acquire()
     lazy = False
     if a.engine == "strata":
         if not cfg:
@@ -8456,6 +8575,7 @@ def main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> in
                   fit_max_tokens=a.fit_max_tokens or (not a.no_fit_max_tokens and cfg.get("fit_max_tokens") is not False))
     svc.launch_attestation = launch_attestation
     svc.offline = a.offline
+    svc.set_idle_power(power)
     svc.max_queue = max_queue
     svc.queue_timeout_s = float(queue_timeout) if queue_timeout is not None else None
     if a.engine == "strata":                            # the model card's sampling when nothing else is said (see MODEL_CARD_SAMPLING)
@@ -8568,6 +8688,7 @@ def main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> in
     if not isinstance(recovery, bool):
         raise SystemExit(f"[strata] config \"tool_call_recovery\" must be true or false, not {recovery!r}")
     svc.tool_call_recovery = recovery
+    svc.tool_call_passthrough = tool_call_passthrough_setting(cfg)
     etu = cfg.get("env_to_user", False)                # opt-in: see frontend._env_to_user
     if not isinstance(etu, bool):
         raise SystemExit(f"[strata] config \"env_to_user\" must be true or false, not {etu!r}")
@@ -8667,13 +8788,21 @@ def main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> in
             ready_file.publish(ready_path, record)
         except OSError as e:
             print(f"[strata] could not write ready file ({type(e).__name__})", file=sys.stderr)
-            for close in (httpd.shutdown, getattr(engine, "close", None), vision.shutdown if vision else None,
-                          hub.close if hub is not None else None):
-                if close:
-                    close()
+            try:
+                for close in (httpd.shutdown, getattr(engine, "close", None), vision.shutdown if vision else None,
+                              hub.close if hub is not None else None):
+                    if close:
+                        close()
+            finally:
+                if startup_power_held:
+                    power.release()
+                if power is not None:
+                    power.close()
             return 6
     if event_sink is not None:
         notify_lifecycle("ready", record)
+    if startup_power_held:
+        power.release()
     interrupted = False
     drained = True
     try:
@@ -8684,6 +8813,7 @@ def main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> in
         notify_lifecycle("stopping", {"reason": termination, "instance_id": svc.instance_id})
         print("\n[strata] stopping (Ctrl+C again to end the engine at once) ...", flush=True)
     finally:
+        shutdown_power_held = power.acquire() if power is not None else False
         cancelled = 0
         if a.shutdown_timeout is not None:
             pending = svc.begin_drain()
@@ -8714,6 +8844,10 @@ def main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> in
                         except Exception as e:  # noqa: BLE001 - never block the exit
                             print(f"[strata] could not release the model files' cache: {e}", flush=True)
         finally:
+            if shutdown_power_held:
+                power.release()
+            if power is not None:
+                power.close()
             if ready_path is not None:
                 ready_file.remove_if_owned(ready_path, svc.instance_id)
             finished.set()

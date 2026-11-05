@@ -5608,7 +5608,13 @@ int main(int argc, char** argv) {
     // the layers it does not own in decode (a "foreign" session), so both can read every layer on alternating chunks.
     // The streamed QSA layers' K/V host copy is the owner's (shared): both paths' appends land in it.  The foreign
     // session of the stage holds layer 1, so it gets its own PLE run (the stage's copy of the weights, its own buffers).
-    strata::core::SessionState dp_ss[2];
+    const int dp_count = (int) stages.size() + 1;
+    std::vector<strata::core::SessionState> dp_ss((size_t) dp_count);
+    std::vector<std::shared_ptr<void>> dp_arenas, dp_aux;
+    std::vector<strata::prefill::Prefill*> dp_paths;
+    std::vector<int> dp_devices{primary_device};
+    std::vector<strata::core::SessionState*> dp_owners{&ss};
+    for (auto& st : stages) { dp_devices.push_back(st->dev); dp_owners.push_back(&st->ss); }
     bool dp_shared[2] = {false, false};   // [claude] STRATA_TP_SHARE_DP: the foreign session is in the TP session's arena
     bool dp_on = false;
     {
@@ -5618,7 +5624,7 @@ int main(int argc, char** argv) {
         bool ok = asked && multi_gpu && stages.size() == 1 && o.batch == 0 && o.peer_device < 0 && !stage_trim &&
                   kd != nullptr && kd[0] == '1' && g.n_qsa_layers() > 0 && ss.qsa_states[ss.qsa_primary()].kv_mode == 1 &&
                   stages[0]->ss.qsa_states[stages[0]->ss.qsa_primary()].kv_mode == 1;
-        if (asked && !ok)
+        if (asked && !ok && dp_count == 2)
             std::fprintf(stderr, "strata generate: STRATA_DP_PREFILL is off (two GPUs in a layer split, no --batch / "
                                  "--peer-device / stage trim, streamed K/V and STRATA_KV_HOST_DMA=1)\n");
         for (int i = 0; ok && i < 2; ++i) {
@@ -5699,6 +5705,107 @@ int main(int argc, char** argv) {
                          (long long) split_at[0], (long long) g.n_layers, stages[0]->dev, (long long) split_at[0]);
     }
 
+    if (dp_count > 2) {
+        const char* ev = std::getenv("STRATA_DP_PREFILL");
+        const char* kd = std::getenv("STRATA_KV_HOST_DMA");
+        const bool asked = ev != nullptr && ev[0] == '1';
+        bool ok = asked && multi_gpu && !stages.empty() && (o.batch == 0 || stages.size() > 1) &&
+                  o.peer_device < 0 && !trim_asked && kd != nullptr && kd[0] == '1' && g.n_qsa_layers() > 0;
+        std::vector<strata::core::QsaState> hosts((size_t) g.n_qsa_layers());
+        for (size_t i = 0; ok && i < dp_owners.size(); ++i) {
+            const int64_t lo = i == 0 ? 0 : split_at[i - 1];
+            const int64_t hi = i == stages.size() ? g.n_layers : split_at[i];
+            int64_t q = lo / std::max<int64_t>(g.qsa_interval, 1);
+            for (int64_t l = lo; l < hi; ++l) if (strata::core::is_qsa_layer(g, l)) {
+                hosts[(size_t) q] = dp_owners[i]->qsa_states[q];
+                if (hosts[(size_t) q].kv_mode != 1 || !hosts[(size_t) q].kv_host_base) ok = false;
+                ++q;
+            }
+        }
+        if (asked && !ok)
+            std::fprintf(stderr, "strata generate: DP off: needs a layer split, full weights, streamed K/V, "
+                                 "STRATA_KV_HOST_DMA=1 and no peer helper (two paths also need no batch slots)\n");
+        for (int i = 0; ok && i < dp_count; ++i) {
+            const int dev = dp_devices[(size_t) i];
+            const strata::core::OnDevice on(dev);
+            auto* state = &dp_ss[(size_t) i];
+            const auto* rope = &dp_owners[(size_t) i]->qsa_states[dp_owners[(size_t) i]->qsa_primary()];
+            void* buf = nullptr;
+            if (cudaMalloc(&buf, strata::core::session_bytes(g, o.max_context, K, 0, -1, rope)) != cudaSuccess) {
+                ok = false;
+                break;
+            }
+            // Register the allocation before init: partial initialization takes the same cleanup path.
+            dp_arenas.emplace_back(buf, [dev, state](void* p) {
+                const strata::core::OnDevice on(dev);
+                cudaDeviceSynchronize();
+                strata::core::session_release(*state);
+                if (state->qsa_states) {
+                    for (int64_t q = state->qsa_ord0; q < state->qsa_ord0 + state->qsa_alloc; ++q) {
+                        auto& s = state->qsa_states[q];
+                        if (s.host_step) cudaFreeHost(s.host_step);
+                        if (s.host_pos) cudaFreeHost(s.host_pos);
+                        // Host K/V and RoPE are borrowed; never free the decode owner's allocation.
+                    }
+                    delete[] state->qsa_states;
+                    state->qsa_states = nullptr;
+                }
+                cudaFree(p);
+            });
+            if (strata::core::session_init(g, o.max_context, K, buf, *state, 0, -1, rope, hosts.data()) == 0) {
+                ok = false;
+                break;
+            }
+            strata::core::session_zero(*state, g, nullptr, nullptr);
+            if (cudaDeviceSynchronize() != cudaSuccess) ok = false;
+        }
+        for (int i = 1; ok && ss.ple.ready() && i < dp_count; ++i) {
+            auto& st = *stages[(size_t) i - 1];
+            const strata::core::OnDevice on(st.dev);
+            auto& S = dp_ss[(size_t) i];
+            auto& P = S.ple;
+            P = ss.ple;
+            auto fw = [&](const char* n) { return st.wt.find(n); };
+            const auto *wk = fw("blk.1.ple_key.weight"), *wv = fw("blk.1.ple_value.weight"),
+                       *wnk = fw("blk.1.ple_norm_key.weight"), *wnq = fw("blk.1.ple_norm_query.weight"),
+                       *wnc = fw("blk.1.ple_norm_conv.weight"), *wc = fw("blk.1.ple_conv1d.weight");
+            float *emb = nullptr, *scr = nullptr;
+            auto keep = [&](void* p) {
+                if (p) dp_aux.emplace_back(p, [dev = st.dev](void* ptr) {
+                    const strata::core::OnDevice on(dev);
+                    cudaDeviceSynchronize();
+                    cudaFree(ptr);
+                });
+            };
+            const bool allocated = cudaMalloc((void**) &emb, (size_t) strata::kernels::NG_N_EMBD * 4) == cudaSuccess &&
+                                   cudaMalloc((void**) &scr, strata::core::ple_run_scratch_bytes()) == cudaSuccess;
+            keep(emb); keep(scr);
+            if (!allocated || !wk || !wv || !wnk || !wnq || !wnc || !wc) { ok = false; break; }
+            P.w = strata::kernels::PleWeights{};
+            if (!wk->quantized()) P.w.key_bf16 = (const uint16_t*) wk->data;
+            else if (wk->data) {
+                P.w.key_codes = (const uint8_t*) wk->data;
+                P.w.key_scales = (const float*) ((const uint8_t*) wk->data + wk->codes_bytes);
+            }
+            if (ss.ple.w.key_native_data && wk->quantized() && wk->native_data) {
+                P.w.key_native_data = wk->native_data;
+                P.w.key_native_type = wk->native_type;
+                P.w.key_native_q8_1 = wk->native_q8_1;
+            }
+            P.w.value_bf16 = (const uint16_t*) wv->data;
+            P.w.norm_key = (const float*) wnk->data; P.w.norm_query = (const float*) wnq->data;
+            P.w.norm_conv = (const float*) wnc->data; P.w.conv1d_f16 = (const uint16_t*) wc->data;
+            P.hist = S.ple_hist; P.prev = S.ple_prev; P.token = &S.ple_token;
+            P.emb_dev = emb; P.scratch = scr;
+            if (!P.ready()) ok = false;
+        }
+        if (asked && !ok) { dp_aux.clear(); dp_arenas.clear(); (void) cudaGetLastError(); }
+        dp_on = ok;
+        if (asked && !ok) std::fprintf(stderr, "strata generate: DP prompt sessions unavailable; layer pipeline retained\n");
+        if (dp_on) std::fprintf(stderr, "strata generate: DP prompt paths: %d GPUs, all %lld layers per path\n",
+                                dp_count, (long long) g.n_layers);
+    }
+
     // --batch: every stage carves o.batch more sessions like its own (same layer range and context), one per
     // slot of the batch windows.  Before the expert cache is sized, so `--expert-cache auto` leaves them room.
     // Recommend, never force: a count the engine cannot run is said and adjusted (or batching left off) - the
@@ -5721,6 +5828,7 @@ int main(int argc, char** argv) {
         bin.batch_mtp = mtp_on;
         bin.adapt_async = o.adapt_async != 0;
         { const char* ms = std::getenv("STRATA_BATCH_MTP_SERIAL"); bin.mtp_serial = ms != nullptr && ms[0] != '\0' && ms[0] != '0'; }
+        { const char* mp = std::getenv("STRATA_PIPED_MTP"); bin.mtp_piped = mp && mp[0] != '\0' && mp[0] != '0'; }
 #if !defined(STRATA_USE_HIP)
         { const char* nv = std::getenv("STRATA_BATCH_GROUPS_NV_SERIAL"); bin.nv_serial_faster = nv == nullptr || nv[0] != '0'; }   // PROPOSED 0.2.1 default (NVIDIA, 2 cards)
 #endif
@@ -5735,7 +5843,7 @@ int main(int argc, char** argv) {
                         ? "it needs each stage of a layer split on its own GPU"
                         : !o.serve ? "it needs --serve" : nullptr;
         // the groups it would run with (the default gives way to it: one group; a number or auto given pipelines)
-        if (why == nullptr && !stages.empty() && batch_groups_for(true).groups > 1)
+        if (why == nullptr && !stages.empty() && batch_groups_for(true).groups > 1 && !batch_groups_for(true).mtp_piped)
             why = batch_groups_for(true).mtp_dropped
                 ? "a layer split with --batch pipelines the slots in groups by default and the pipelined groups run no slot "
                   "drafts (4 streams on 2 GPUs: 25-30% faster than the serial MTP windows); --batch-groups 1 or "
@@ -5750,6 +5858,28 @@ int main(int argc, char** argv) {
             batch_mtp = false;
         }
     }
+    // STRATA_PIPED_MTP (opt-in): --batch-mtp's proposals in the pipelined groups of a layer split, one slot per group;
+    // each stage commits a group's window once the last stage has judged its proposals
+    // (Verifier::batch_launch_rows / batch_commit_rows)
+    bool piped_mtp = batch_mtp && !stages.empty() && batch_groups_for(true).mtp_piped;   // (final once the slots that fit are known, below)
+    // STRATA_PIPED_MTP=N: up to N proposals per slot and window (at most --spec - 1); the first always, each further
+    // one while the draft layer is at least --spec-min-p sure of it, as the solo path extends its windows
+    int pm_drafts = 0;
+    if (piped_mtp) {
+        pm_drafts = std::clamp(std::atoi(std::getenv("STRATA_PIPED_MTP")), 1,
+                               std::max(1, std::min(o.spec - 1, (int) strata::kernels::kVerifyMaxT - 1)));
+    }
+    // The verifiers' window: the solo path's drafts (--spec rows), the plain batch windows (the slots) and, with
+    // STRATA_PIPED_MTP, a group's rows: its slots, each its token and its proposals ((slots) * (1 + proposals), one slot
+    // per group = at most --spec rows).  A function, not a number: --batch (the slots that fit) and the groups are final
+    // only after this point, at the verifiers' init, and the plain value must stay what it was there.
+    auto batch_max_t = [&]() -> int {
+        if (batch_mtp && !piped_mtp) return (int) strata::kernels::kVerifyMaxT;
+        const int plain = std::max(o.spec, std::min(o.batch, (int) strata::kernels::kVerifyMaxT));
+        const int group_rows = (piped_mtp && o.batch_groups > 1 && o.batch > 0)
+            ? std::min<int>(strata::kernels::kVerifyMaxT, (o.batch / o.batch_groups) * (1 + pm_drafts)) : 0;
+        return std::max(plain, group_rows);
+    };
     // The most slots, up to n, whose windows hold at most kVerifyMaxT rows each: n itself up to that, more only as
     // pipelined groups on a layer split - the groups as resolved below (a number given, auto, or the default's one
     // group for --adapt-async 1), dividing the slots, each at most kVerifyMaxT, all at most one group's worth per
@@ -5871,6 +6001,34 @@ int main(int argc, char** argv) {
         }
     }
 
+    // STRATA_PIPED_MTP is decided again now that the slots that fit and the groups are final.  Recommend, never force: when
+    // it cannot run it is said and left off, and --batch-mtp goes on as it would without it.
+    if (piped_mtp) {
+        const char* why = nullptr;
+        char buf[160];
+        const char* sc = std::getenv("STRATA_BATCH_SELF_COMMIT");
+        if (o.batch < 2 || o.batch_groups <= 1) {
+            std::snprintf(buf, sizeof buf, "it needs 2 or more pipelined groups and %d slot%s in %d group%s are left", o.batch,
+                          o.batch == 1 ? "" : "s", o.batch_groups, o.batch_groups == 1 ? "" : "s");
+            why = buf;
+        } else if (sc != nullptr && sc[0] != '\0' && sc[0] != '0') {
+            why = "it does not combine with STRATA_BATCH_SELF_COMMIT (the window would keep its rows itself)";
+        } else if ((o.batch / o.batch_groups) * (1 + pm_drafts) > (int) strata::kernels::kVerifyMaxT) {
+            std::snprintf(buf, sizeof buf, "a group's window would hold %d rows (%d slots x %d), more than %d",
+                          (o.batch / o.batch_groups) * (1 + pm_drafts), o.batch / o.batch_groups, 1 + pm_drafts,
+                          (int) strata::kernels::kVerifyMaxT);
+            why = buf;
+        }
+        if (why != nullptr) {
+            std::fprintf(stderr, "strata generate: WARNING: STRATA_PIPED_MTP is off: %s\n", why);
+            piped_mtp = false;
+        } else {
+            std::fprintf(stderr, "strata generate: STRATA_PIPED_MTP: %d pipelined group%s of %d slot%s draft up to %d MTP "
+                                 "proposal%s per slot each window\n", o.batch_groups, o.batch_groups == 1 ? "" : "s",
+                         o.batch / o.batch_groups, o.batch / o.batch_groups == 1 ? "" : "s", pm_drafts,
+                         pm_drafts > 1 ? "s" : "");
+        }
+    }
     // Secure MTP's CUDA0 allocations before the large host arena is registered with both CUDA contexts.
     // In particular WDDM can refuse the draft weights after mapping tens of GiB of host pages.
     strata::core::MtpDrafter mtp;
@@ -5954,12 +6112,13 @@ int main(int argc, char** argv) {
             // runs on the first stage, as for the solo drafter (`mtp.set_ple_session(&ss)` above).
             for (int b = 0; b < o.batch; ++b) {
                 auto d = std::make_unique<strata::core::MtpDrafter>();
+                if (piped_mtp) d->set_force_capture(true);
                 if (!d->load(o.mtp, draft_geometry, *bslot_ss.back()[(size_t) b], o.spec, err, o.mtp_window, &mtp)) {
                     std::fprintf(stderr, "strata generate: batch MTP slot %d: %s%s\n", b, err.c_str(),
                                  vram_free_note().c_str());
                     return 1;
                 }
-                d->set_max_drafts(1);   // the first candidate verifies one proposal per slot
+                d->set_max_drafts(piped_mtp ? pm_drafts : 1);   // serial windows verify one proposal per slot
                 d->set_ple_session(bslot_ss[0][(size_t) b].get());
                 slot_mtp.push_back(std::move(d));
             }
@@ -9331,7 +9490,7 @@ int main(int argc, char** argv) {
                                      "context, or read prompts in smaller chunks (--prefill 512)\n");
             return 1;
         }
-        if (dp_on) {   // [claude] the DP prompt path's link (both paths run init above)
+        if (dp_on && dp_count == 2) {   // retain the native DP2 / TP2 link
             std::shared_ptr<strata::prefill::Prefill::DpLink> link =
                 strata::prefill::Prefill::make_dp_link((int) g.n_layers, 0, stages[0]->dev, err);
             if (!link) {
@@ -9350,6 +9509,20 @@ int main(int argc, char** argv) {
                 }
                 std::fprintf(stderr, "strata serve: DP prompt path linked (chunk up to %lld tokens)\n",
                              (long long) o.prefill_chunk);
+            }
+        }
+        if (dp_on && dp_count > 2) {
+            dp_paths.push_back(&sp);
+            for (auto& st : stages) dp_paths.push_back(&st->sp);
+            auto link = strata::prefill::Prefill::make_dp_link((int) g.n_layers, dp_devices, err);
+            if (!link) {
+                std::fprintf(stderr, "strata serve: DP link failed: %s; layer pipeline retained\n", err.c_str());
+                dp_on = false;
+                err.clear();
+            } else for (int i = 0; i < dp_count; ++i) {
+                const int64_t lo = i == 0 ? 0 : split_at[(size_t) i - 1];
+                const int64_t hi = i + 1 == dp_count ? g.n_layers : split_at[(size_t) i];
+                dp_paths[(size_t) i]->set_dp(dp_paths[(size_t) ((i + 1) % dp_count)], &dp_ss[(size_t) i], lo, hi, link, i);
             }
         }
         if (peer.valid() && o.peer_prefill_rows != 0) {
@@ -9493,7 +9666,8 @@ int main(int argc, char** argv) {
         if (n_stages > 1) {
             // pipelined slot groups write their rows at hbase = group * rows-per-group, so with more than
             // kVerifyMaxT slots in groups the hand-off holds one row per slot (otherwise kVerifyMaxT, as before)
-            const int hrows = !batch_mtp && o.batch_groups > 1 ? std::max<int>(strata::kernels::kVerifyMaxT, o.batch)
+            const int hrows = piped_mtp ? std::max<int>(strata::kernels::kVerifyMaxT, (1 + pm_drafts) * o.batch)
+                              : !batch_mtp && o.batch_groups > 1 ? std::max<int>(strata::kernels::kVerifyMaxT, o.batch)
                                                                : strata::kernels::kVerifyMaxT;
             const size_t hb = (size_t) hrows * (size_t) strata::core::Verifier::handoff_floats(g) * sizeof(float);
             std::vector<float*> hand((size_t) n_stages - 1, nullptr);
@@ -9563,8 +9737,7 @@ int main(int argc, char** argv) {
                     // rows, the hand-off's size) and bounds its captured batch layouts like the first (below)
                     if (batch_mtp) gs.ver.set_batch_graph_limit(64);
                     ok_s = gs.ver.init(gs.wt, g, gs.ss, vs, gs.head.loaded() ? &gs.head : nullptr,
-                                       batch_mtp ? strata::kernels::kVerifyMaxT
-                                                 : std::max(o.spec, std::min(o.batch, (int) strata::kernels::kVerifyMaxT)), err);
+                                       batch_max_t(), err);
                     split_drive.cache_base[st] = gs.cache.device_slot(0);
                     split_drive.cache_slot_off[st] = gs.cache.slot_offsets();
                     split_drive.pcie_num[st] = pcie_num_of(gs.pcie_frac);
@@ -9644,7 +9817,7 @@ int main(int argc, char** argv) {
         if (pcie_balance() && n_stages == 1) ver.set_pcie_balance(&drive.d.pcie_model);
         if (batch_mtp) ver.set_batch_graph_limit(64);   // --batch-mtp only: slot rotation makes many layouts (LRU); 0.1.39 keeps all
         if (!ver.init(wt, g, ss, vh, native_head.loaded() || prefill_head_alias_bound ? &native_head : nullptr,
-                      batch_mtp ? strata::kernels::kVerifyMaxT : std::max(o.spec, std::min(o.batch, (int) strata::kernels::kVerifyMaxT)), err) ||
+                      batch_max_t(), err) ||
             (use_mtp && !prefill_head_alias_bound && (mtp.set_hc_r8_allowed(!pipe), true) && !mtp.bind(last_st && !mtp_first ? last_st->wt : wt, last_st ? &last_st->head : &native_head,
                                   pipe ? pl_mtp_R : ver.final_R_all(), err))) {
             std::fprintf(stderr, "strata serve: %s\n", err.c_str());
@@ -9668,7 +9841,7 @@ int main(int argc, char** argv) {
                 }
                 slot_mtp_rows.emplace_back(r, free_slot_mtp_rows);
                 if (!slot_mtp[(size_t) b]->bind(last_st ? last_st->wt : wt, last_st ? &last_st->head : &native_head, r, err,
-                                                &mtp)) {
+                                                &mtp) || (piped_mtp && !slot_mtp[(size_t) b]->prepare_chain(err))) {
                     std::fprintf(stderr, "strata serve: batch MTP slot %d: %s%s\n", b, err.c_str(),
                                  vram_free_note().c_str());
                     return 1;
@@ -9684,6 +9857,11 @@ int main(int argc, char** argv) {
                 const strata::core::OnDevice on_k(k == 0 ? 0 : stages[k - 1]->dev);
                 if (!vk.init_slots(ptrs, err)) {
                     std::fprintf(stderr, "strata serve: --batch, stage %zu: %s\n", k + 1, err.c_str());
+                    return 1;
+                }
+                if (piped_mtp && bslot_ss.size() > 1 &&
+                    !vk.init_deferred_commit(std::max<int>(strata::kernels::kVerifyMaxT, (1 + pm_drafts) * o.batch), err)) {
+                    std::fprintf(stderr, "strata serve: deferred batch state: %s\n", err.c_str());
                     return 1;
                 }
             }
@@ -12214,6 +12392,7 @@ int main(int argc, char** argv) {
             int32_t x = 0;                 ///< the token the next window feeds (not yet in the slot's state)
             std::array<int32_t, strata::kernels::kVerifyMaxT> draft{}; ///< the slot's next MTP proposal
             bool draft_ready = false;
+            int n_drafts = 1;
             int64_t p = 0;                 ///< its position
             int64_t produced = 0, max_new = 0;
             Clock::time_point t0;
@@ -12633,13 +12812,24 @@ int main(int argc, char** argv) {
         // ---- --batch-groups: the slot groups pipelined through the stages (--batch-groups G > 1 with a layer split)
         const int n_pipe = (int) stages.size() + 1;
         const bool piped = o.batch > 0 && o.batch_groups > 1 && n_pipe > 1;
+        auto dp4_whole = [&] {
+            auto on = [](const char* key) { const char* v = std::getenv(key); return v && std::atoll(v) > 0; };
+            return dp_on && dp_count > 2 && (o.batch == 0 || piped) &&
+                   !on("STRATA_PIPED_CONCURRENT") && !on("STRATA_PIPED_READ_PIECE");
+        };
+        const int64_t dp4_min_last = o.mtp.empty() ? kDpMinLast :
+            std::max<int64_t>(kDpMinLast, o.mtp_window > 0 && o.mtp_window < o.max_context
+                                           ? (o.mtp_window + 64 + 255) / 256 * 256 : o.max_context);
         strata::core::StageInFlightSampler stage_in_flight(n_pipe, piped && batch_telemetry_enabled);
-        if (piped && batch_mtp)   // #1413: said, not silent
+        const int GS = piped ? o.batch / o.batch_groups : o.batch;
+        const int pmtp_rows_per_slot = 1 + pm_drafts;
+        const int pmtp_rows_per_group = GS * pmtp_rows_per_slot;
+        const bool pmtp = piped && piped_mtp && ver.deferred_commit_on() && pmtp_rows_per_group <= batch_max_t();
+        if (piped && batch_mtp && !pmtp)   // #1413: said, not silent
             std::fprintf(stderr,
                          "strata generate: WARNING: --batch-groups %d runs the pipelined path, which builds one row per slot: "
                          "--batch-mtp's per-slot MTP drafts do not run there (their drafters still hold VRAM, about 0.9 GB per "
                          "slot). Drop --batch-mtp, or use --batch-groups 1.\n", o.batch_groups);
-        const int GS = piped ? o.batch / o.batch_groups : o.batch;
         if (GS > strata::kernels::kVerifyMaxT && !batch_mtp) {   // (slots_in_windows keeps it so: a group's window is
             // PGroup's rows, and the serial windows reach only the first kVerifyMaxT slots)
             std::fprintf(stderr, "strata generate: --batch %d in %d group%s: more than %d rows per window\n",
@@ -12656,6 +12846,8 @@ int main(int argc, char** argv) {
             int S = 0;                      ///< slots in its window: up to its last active one (idle ones cost rows)
             int active = 0;                  ///< live slots at launch; S can also include idle padding rows
             Clock::time_point started;       ///< the group window's first stage launch
+            int rows[strata::kernels::kVerifyMaxT] = {};
+            int hbase = 0;
         };
         std::vector<PGroup> pg((size_t) (piped ? o.batch_groups : 0));
         std::vector<int> stage_group((size_t) n_pipe, -1);
@@ -12677,6 +12869,176 @@ int main(int argc, char** argv) {
         std::mutex bell_mu;
         std::condition_variable bell_cv;
         std::atomic<bool> bell_waiting{false};
+        // STRATA_PIPED_MTP: a slot whose next proposals are drafting (its chain in flight on the drafter's stream), and
+        // per slot the event after the copy of its rows on the last stage's stream, which the chain waits for
+        std::vector<char> pm_drafting(bs.size(), 0);
+        std::vector<cudaEvent_t> pm_copied(pmtp ? bs.size() : 0, nullptr);
+
+        // Destroy events only after every owned window/chain has relinquished its inputs, including an error exit.
+        struct PmtpQuiesce { std::function<void()> finish; ~PmtpQuiesce() { finish(); } };
+        PmtpQuiesce pm_quiesce{[&] {
+            if (!pmtp) return;
+            for (int k = 0; k < n_pipe; ++k) {
+                auto& vk = stage_verifier(k);
+                const strata::core::OnDevice on(vk.device());
+                if (vk.batch_busy() || cudaStreamQuery(vk.stream()) == cudaErrorNotReady)
+                    (void) vk.release_gpu_waits(5000);
+                (void) cudaStreamSynchronize(vk.stream());
+            }
+            std::string ignored;
+            for (auto& draft : slot_mtp) if (draft) (void) draft->idle(ignored);
+            const strata::core::OnDevice on_last(stage_verifier(n_pipe - 1).device());
+            for (auto ev : pm_copied) if (ev) cudaEventDestroy(ev);
+        }};
+        if (pmtp) {
+            const strata::core::OnDevice on_last(stage_verifier(n_pipe - 1).device());
+            for (cudaEvent_t& e : pm_copied)
+                if (cudaEventCreateWithFlags(&e, cudaEventDisableTiming) != cudaSuccess) {
+                    std::fprintf(stderr, "strata serve: STRATA_PIPED_MTP: event creation failed\n");
+                    return 1;
+                }
+        }
+        // the chain of slot b has landed: its proposals are the slot's next drafts (1), still drafting (0), or an error (-1)
+        auto pmtp_poll_draft = [&](int b, bool wait) -> int {
+            if (!pm_drafting[(size_t) b]) return 1;
+            for (;;) {
+                const int r = slot_mtp[(size_t) b]->chain_poll(err);
+                if (r < 0) { std::printf("ERR batch MTP slot %d: %s\n", b, err.c_str()); return -1; }
+                if (r == 1) break;
+                if (!wait) return 0;
+            }
+            pm_drafting[(size_t) b] = 0;
+            // the first proposal always; another while the draft layer was at least --spec-min-p sure of the one before
+            // (the solo path's rule, MtpDrafter::draft)
+            BSlot& sl = bs[(size_t) b];
+            const int32_t* tok = slot_mtp[(size_t) b]->chain_tok();
+            const float* prob = slot_mtp[(size_t) b]->chain_prob();
+            sl.n_drafts = 1;
+            sl.draft[0] = tok[0];
+            while (sl.n_drafts < pm_drafts && prob[sl.n_drafts - 1] >= (float) o.spec_min_p) {
+                sl.draft[(size_t) sl.n_drafts] = tok[sl.n_drafts];
+                ++sl.n_drafts;
+            }
+            sl.draft_ready = true;
+            return 1;
+        };
+        // STRATA_PIPED_MTP: the last stage has picked for group gi's window (its slot's token and G.S - 1 proposals).
+        // Judge the proposals, queue every stage's commit of the kept rows (each stage runs it before that group's next
+        // window there: the same stream), emit them, and start drafting the next proposals.
+        auto pmtp_verdict = [&](PGroup& G, strata::core::Verifier& vk, const int32_t* outb) -> bool {
+            auto is_eos = [&](int32_t y) {
+                return std::find(o.eos_ids.begin(), o.eos_ids.end(), (int64_t) y) != o.eos_ids.end();
+            };
+            // each slot of the group owns a contiguous block of the window's rows: its token, then its own proposals
+            struct Blk { int b = 0, f = 0, n = 0, keep = 1; };
+            std::vector<Blk> blks;
+            std::vector<int> keep(bs.size(), 1);
+            for (int t = 0; t < G.S;) {
+                const int b = G.rows[t];
+                const int f = t;
+                while (t < G.S && G.rows[t] == b) ++t;
+                BSlot& sl = bs[(size_t) b];
+                // proposal j stands when the target picked it after the row before it (and every earlier one stood); the
+                // group was started only with proposals there is room to emit
+                Blk blk;
+                blk.b = b;
+                blk.f = f;
+                blk.n = t - f;
+                while (blk.keep < blk.n && !sl.stop && outb[f + blk.keep - 1] == G.tok[f + blk.keep] &&
+                       !is_eos(outb[f + blk.keep - 1]))
+                    ++blk.keep;
+                keep[(size_t) b] = blk.keep;
+                bt_accepted += blk.keep - 1;
+                bt_tokens += blk.n - 1;   // (proposals checked)
+                blks.push_back(blk);
+            }
+            for (int k = 0; k < n_pipe; ++k)
+                if (!stage_verifier(k).batch_commit_rows(G.rows, G.S, G.hbase, keep.data(), G.tok, G.pos, err)) {
+                    std::printf("ERR %s\n", err.c_str());
+                    return false;
+                }
+            // #879: a row with non-finite logits: the slot that owns it ends, nothing of it is emitted
+            for (int t = 0; t < G.S; ++t)
+                if (vk.nonfinite_in(t)) {
+                    const int b = G.rows[t];
+                    BSlot& sl = bs[(size_t) b];
+                    std::fprintf(stderr, "strata batch: non-finite logits (#879) in slot %d at position %lld: it ends (BDONE "
+                                         "nonfinite) and the next request reads its prompt from token 0\n", b, (long long) sl.p);
+                    const double ms = std::chrono::duration<double, std::milli>(Clock::now() - sl.t0).count();
+                    std::printf("BDONE %d %lld nonfinite %.1f\n", b, (long long) sl.produced, ms);
+                    sl.active = false;
+                    sl.cached = false;
+                    sl.draft_ready = false;
+                    sl.checks.clear();
+                    nan_flush = true;
+                }
+            for (const Blk& blk : blks) {
+                BSlot& sl = bs[(size_t) blk.b];
+                if (!sl.active) continue;   // it ended above (non-finite logits) or before this window
+                for (int j = 0; j < blk.keep; ++j) {
+                    const int32_t y = outb[blk.f + j];
+                    std::printf("BT %d %d\n", blk.b, (int) y);
+                    ++sl.produced;
+                    ++bt_rows;
+                    ++pipe_rows;
+                    const char* fin = is_eos(y) ? "stop" : sl.stop ? "cancel" : sl.produced >= sl.max_new ? "length"
+                                    : sl.p + 2 > o.max_context ? "length" : nullptr;
+                    sl.ids.push_back(G.tok[blk.f + j]);
+                    if (fin != nullptr) {
+                        const double ms = std::chrono::duration<double, std::milli>(Clock::now() - sl.t0).count();
+                        std::printf("BDONE %d %lld %s %.1f\n", blk.b, (long long) sl.produced, fin, ms);
+                        sl.active = false;
+                        sl.draft_ready = false;
+                        // a cache again (#857), as on the pipelined path without drafts: final once its commits have run
+                        // (pmtp_settle, before anything reads the slot's sessions)
+                        sl.cached = o.prompt_cache > 0 && !sl.img && !sl.tainted;
+                        break;
+                    }
+                    sl.x = y;
+                    sl.p += 1;
+                }
+            }
+            // the next proposal: each slot's drafter catches up on ITS OWN rows of this window and drafts from the last
+            // kept one, as a chain on its own stream (pmtp_poll_draft collects it before the group's next window).  The
+            // rows - the last stage's final residuals - are copied on THAT stage's stream, so its next window, which
+            // rewrites them, runs after the copy; the chain waits for the copy.
+            const size_t stride = (size_t) g.hc * (size_t) g.n_embd;
+            for (const Blk& blk : blks) {
+                BSlot& sl = bs[(size_t) blk.b];
+                if (!sl.active) continue;   // it ended: no more drafts for it
+                const strata::core::OnDevice on_slot_mtp(slot_mtp[(size_t) blk.b]->device());
+                sl.draft_ready = false;
+                const float* src = vk.final_R_all() + (size_t) blk.f * stride;
+                if (cudaMemcpyAsync(slot_mtp_rows[(size_t) blk.b].get(), src, (size_t) blk.n * stride * sizeof(float),
+                                    cudaMemcpyDeviceToDevice, vk.stream()) != cudaSuccess ||
+                    cudaEventRecord(pm_copied[(size_t) blk.b], vk.stream()) != cudaSuccess ||
+                    cudaStreamWaitEvent(slot_mtp[(size_t) blk.b]->stream(), pm_copied[(size_t) blk.b], 0) != cudaSuccess ||
+                    !slot_mtp[(size_t) blk.b]->chain_launch(blk.n, outb + blk.f, G.pos[blk.f], blk.keep - 1, nullptr, 0,
+                                                            pm_drafts, 0, err)) {
+                    std::printf("ERR batch MTP slot %d: %s\n", blk.b,
+                                err.empty() ? "the proposal's chain did not start" : err.c_str());
+                    return false;
+                }
+                pm_drafting[(size_t) blk.b] = 1;
+            }
+            return true;
+        };
+        // STRATA_PIPED_MTP: the commits queued after the verdicts have run on every stage, so whatever reads a slot's
+        // sessions next (an admission, a parked conversation, the solo path taking a slot back) sees its final state
+        auto pmtp_settle = [&]() -> bool {
+            if (!pmtp) return true;
+            for (int b = 0; b < (int) bs.size(); ++b)   // (a chain in flight would refuse the drafter's next use)
+                if (pmtp_poll_draft(b, true) < 0) return false;
+            for (int k = 0; k < n_pipe; ++k) {
+                strata::core::Verifier& vk = stage_verifier(k);
+                const strata::core::OnDevice on_k(vk.device());
+                if (cudaStreamSynchronize(vk.stream()) != cudaSuccess) {
+                    std::printf("ERR a pipelined commit failed on stage %d\n", k + 1);
+                    return false;
+                }
+            }
+            return true;
+        };
         // one turn: serve every running stage, hand finished groups on, start what can start
         auto pump = [&](bool may_start) -> bool {
             ++pipe_tick;
@@ -12698,7 +13060,8 @@ int main(int argc, char** argv) {
                 if (k + 1 < n_pipe) { G.stage = k + 1; G.since = pipe_tick; continue; }
                 // the last stage: the group's picks
                 const int32_t* outb = vk.batch_out();
-                for (int t = 0; t < G.S; ++t) {
+                if (pmtp && !pmtp_verdict(G, vk, outb)) return false;
+                for (int t = 0; t < G.S && !pmtp; ++t) {
                     BSlot& sl = bs[(size_t) (gi * GS + t)];
                     if (!sl.active) continue;
                     if (vk.nonfinite_in(t)) {   // #879: the slot ends, nothing emitted
@@ -12759,22 +13122,56 @@ int main(int argc, char** argv) {
                     if (!may_start) continue;
                     for (int j = 0; j < (int) pg.size() && pick < 0; ++j) {
                         const int gi = (int) ((rr + j) % (int64_t) pg.size());
-                        if (!pg[(size_t) gi].inflight && group_active(gi)) pick = gi;
+                        if (!pg[(size_t) gi].inflight && group_active(gi)) {
+                            bool ready = true;
+                            if (pmtp) for (int t = 0; t < GS; ++t) {
+                                const int dr = pmtp_poll_draft(gi * GS + t, false);
+                                if (dr < 0) return false;
+                                if (!dr) { ready = false; break; }
+                            }
+                            if (ready) pick = gi;
+                        }
                     }
                     if (pick < 0) continue;
                     rr = pick + 1;
                     PGroup& G = pg[(size_t) pick];
                     G.S = 0;
-                    G.active = 0;
-                    for (int t = 0; t < GS; ++t) if (bs[(size_t) (pick * GS + t)].active) {
-                        G.S = t + 1;
-                        ++G.active;
-                    }
-                    for (int t = 0; t < G.S; ++t) {
-                        BSlot& sl = bs[(size_t) (pick * GS + t)];
-                        G.tok[t] = sl.active ? sl.x : 0;
-                        G.pos[t] = sl.active ? sl.p : 0;
-                        if (!sl.active) sl.cached = false;   // its pad row writes its state
+                    if (pmtp) {   // the group's slots: each its token, then its own proposals - as many as could be emitted
+                        G.hbase = pmtp_rows_per_group * pick;
+                        G.S = 0;
+                        G.active = 0;
+                        for (int t = 0; t < GS; ++t) {
+                            const int b = pick * GS + t;
+                            const BSlot& sl = bs[(size_t) b];
+                            if (!sl.active) continue;   // an idle slot carries no row (its state is left untouched)
+                            ++G.active;
+                            G.rows[G.S] = b;
+                            G.tok[G.S] = sl.x;
+                            G.pos[G.S] = sl.p;
+                            ++G.S;
+                            int nd = sl.draft_ready && !sl.stop ? sl.n_drafts : 0;
+                            nd = (int) std::min<int64_t>(nd, std::min<int64_t>(sl.max_new - sl.produced - 1,
+                                                                                o.max_context - sl.p - 2));
+                            for (int j = 0; j < nd; ++j) {
+                                G.rows[G.S] = b;
+                                G.tok[G.S] = sl.draft[(size_t) j];
+                                G.pos[G.S] = sl.p + 1 + j;
+                                ++G.S;
+                            }
+                        }
+                        if (G.S == 0) { G.inflight = false; continue; }   // every slot of the group went idle
+                    } else {
+                        G.active = 0;
+                        for (int t = 0; t < GS; ++t) if (bs[(size_t) (pick * GS + t)].active) {
+                            G.S = t + 1;
+                            ++G.active;
+                        }
+                        for (int t = 0; t < G.S; ++t) {
+                            BSlot& sl = bs[(size_t) (pick * GS + t)];
+                            G.tok[t] = sl.active ? sl.x : 0;
+                            G.pos[t] = sl.active ? sl.p : 0;
+                            if (!sl.active) sl.cached = false;   // its pad row writes its state
+                        }
                     }
                     G.inflight = true;
                     G.stage = 0;
@@ -12791,7 +13188,8 @@ int main(int argc, char** argv) {
                 PGroup& G = pg[(size_t) pick];
                 strata::core::progress().busy.store(true);
                 if (batch_telemetry_enabled) stage_in_flight.launch(k, Clock::now());
-                if (!stage_verifier(k).batch_launch(pick * GS, G.S, G.tok, G.pos, err)) {
+                if (!(pmtp ? stage_verifier(k).batch_launch_rows(G.rows, G.S, G.hbase, G.tok, G.pos, err)
+                           : stage_verifier(k).batch_launch(pick * GS, G.S, G.tok, G.pos, err))) {
                     std::printf("ERR %s\n", err.c_str());
                     return false;
                 }
@@ -12828,12 +13226,13 @@ int main(int argc, char** argv) {
                 // the rest of the read, STRATA_PIPED_CONCURRENT; the request's end turns it off)
                 if (!in_prompt_read) strata::core::progress().busy.store(false);
             }
+            if (pmtp && !pipe_inflight() && !batch_on() && !pmtp_settle()) return false;
             return true;
         };
         auto pipe_drain = [&]() -> bool {
             while (pipe_inflight())
                 if (!pump(false)) return false;
-            return true;
+            return pmtp_settle();
         };
         for (;;) {
             line_drain_ms = 0.0;
@@ -14430,8 +14829,12 @@ int main(int argc, char** argv) {
                 // what this segment needs, capped by the configured chunk: a request lends only what its own
                 // prompt needs, so a large chunk costs a short prompt nothing
                 int64_t want_full = planned_chunk(tokens, o.prefill_chunk, pf_plan_chunk);
+                const int64_t dn = tokens - dp_head(a0);
+                if (dp4_whole() && exact <= 0 && pf_plan_chunk <= 0 &&
+                    strata::prefill::dp::takes(dn, o.prefill_chunk, dp_count, dp4_min_last))
+                    want_full = strata::prefill::dp::step_for(dn, o.prefill_chunk, dp_count);
                 bool tp_read = false;   // [claude] TP prefill: this segment's loan carves the exchange buffers
-                if (dp_on) {   // [claude] DP: a long segment lends the DP plan's step; the layer pipeline keeps its chunk
+                if (dp_on && dp_count == 2) {   // preserve the DP2 / TP2 loan
                     // the part DP reads: read_part takes the head to the next K/V block boundary on the pipeline first
                     // (a segment after the root checkpoint starts inside a block: an 8,448-token prompt left DP 8,191
                     // tokens, a 4,096 step under kDpMinLast, and the pipeline read it in the lent 4,224-token chunks)
@@ -14599,7 +15002,7 @@ int main(int argc, char** argv) {
                 const int64_t C = planned ? std::max<int64_t>(1, sp.chunk() / plan.chunk) * plan.chunk
                                           : std::max<int64_t>(sp.chunk(), 1);
                 const int64_t C_read = planned ? plan.chunk : C;   // what the yield test calls a chunk
-                if (!planned && dp_on && tpp_takes(b0 - a0 - dp_head(a0))) {
+                if (!planned && dp_on && dp_count == 2 && tpp_takes(b0 - a0 - dp_head(a0))) {
                     // [claude] TP prefill: both GPUs read every layer of the same chunks (Prefill::run_tp); a head to the
                     // next K/V block boundary first (the pipeline, as DP); a prompt it cannot take goes on below
                     const int64_t head = dp_head(a0);
@@ -14626,7 +15029,7 @@ int main(int argc, char** argv) {
                     }
                     return sp.run(ids.data() + a0 + head, tn, a0 + head, e);
                 }
-                if (!planned && dp_on && dp_takes(b0 - a0 - dp_head(a0), o.prefill_chunk)) {
+                if (!planned && dp_on && dp_count == 2 && dp_takes(b0 - a0 - dp_head(a0), o.prefill_chunk)) {
                     // [claude] DP: both GPUs on alternating chunks; a head to the next K/V block boundary first (the
                     // pipeline), and the pipeline for a prompt the plan cannot take
                     const int64_t head = dp_head(a0);
@@ -15043,6 +15446,23 @@ int main(int argc, char** argv) {
                     }
                 }
                 int64_t piece = piece_now();
+                if (piece <= 0 && !planned && dp4_whole() && req_imgs.empty()) {
+                    int64_t cap = o.prefill_chunk;
+                    for (auto* path : dp_paths) cap = std::min(cap, path->chunk());
+                    const int64_t head = dp_head(a0), dn = b0 - a0 - head;
+                    if (strata::prefill::dp::takes(dn, cap, dp_count, dp4_min_last)) {
+                        if (head && !run(a0, a0 + head)) return false;
+                        if (strata::prefill::Prefill::run_dp(dp_paths, ids.data() + a0 + head,
+                                                            dn, a0 + head, cap, dp4_min_last, e)) {
+                            dp_read_req = true;
+                            req_chunk = strata::prefill::dp::step_for(dn, cap, dp_count);
+                            return true;
+                        }
+                        if (e.rfind("prefill DP: decline:", 0) != 0) return false;
+                        std::fprintf(stderr, "strata serve: %s\n", e.c_str());
+                        return run(a0 + head, b0);
+                    }
+                }
                 if (piece <= 0) return run(a0, b0);
                 for (int64_t q = a0; q < b0;) {
                     const int64_t r = std::min(b0, q + piece);

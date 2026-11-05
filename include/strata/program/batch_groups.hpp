@@ -24,6 +24,7 @@ struct Input {
     int given = 1;             ///< the number given (1 when none)
     int batch = 0;             ///< the slots
     int later_stages = 0;      ///< the layer split's stages after CUDA0 (0: no layer split)
+    bool mtp_piped = false;    ///< STRATA_PIPED_MTP explicitly enables deferred slot drafts
     bool batch_mtp = false;    ///< --batch-mtp is on (it passed the gates that do not concern the groups)
     bool adapt_async = false;  ///< --adapt-async 1 was asked for
     bool mtp_serial = false;   ///< STRATA_BATCH_MTP_SERIAL=1: --batch-mtp with no --batch-groups runs one serial group (0.1.43)
@@ -35,6 +36,7 @@ struct Result {
     bool from_auto = false;            ///< the number came from `auto` (given or the 0.1.41 default)
     Serial serial = Serial::None;      ///< `auto` would have pipelined, but this feature needs the serial windows
     int would_be = 1;                  ///< what `auto` would have picked without it (== groups unless `serial`)
+    bool mtp_piped = false;
     bool mtp_dropped = false;          ///< --batch-mtp met the default pipeline: the pipeline wins, --batch-mtp is off
 };
 
@@ -52,7 +54,10 @@ inline Result resolve(const Input& in) {
     r.groups = in.given;
     r.would_be = in.given;
     const bool defaulted = !in.set && in.later_stages > 0 && in.batch > 1;   // the 0.1.41 default
-    if (!in.auto_given && !defaulted) return r;
+    if (!in.auto_given && !defaulted) {
+        r.mtp_piped = in.batch_mtp && in.mtp_piped && r.groups > 1;
+        return r;
+    }
     r.from_auto = true;
     r.would_be = auto_groups(in.later_stages, in.batch);
     r.groups = r.would_be;
@@ -60,9 +65,10 @@ inline Result resolve(const Input& in) {
         if (in.batch_mtp && in.mtp_serial) r.serial = Serial::BatchMtp;
         else if (in.nv_serial_faster && in.later_stages == 1 && !in.batch_mtp && !in.adapt_async) r.serial = Serial::TwoCardsSerialFaster;
         else if (in.adapt_async) r.serial = Serial::AdaptAsync;
-        r.mtp_dropped = in.batch_mtp && r.serial == Serial::None;
+        r.mtp_dropped = in.batch_mtp && !in.mtp_piped && r.serial == Serial::None;
         if (r.serial != Serial::None) r.groups = 1;
     }
+    r.mtp_piped = in.batch_mtp && in.mtp_piped && r.groups > 1 && r.serial == Serial::None;
     return r;
 }
 

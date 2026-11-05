@@ -79,8 +79,13 @@ class KeepAwakeTests(unittest.TestCase):
 
     def test_service_holds_for_the_whole_request_including_early_close(self):
         tok = ByteTokenizer()
-        svc = Service(MockEngine(tok, "ok"), tok, ChatTemplate(ROOT / "serve/chat_template.jinja"))
         rec = Recorder()
+        class ObservedEngine(MockEngine):
+            def generate(engine, *args, **kwargs):
+                # Observe the asynchronous fake OS call before the request ends.
+                self.assertTrue(wait_for(lambda: rec.calls and rec.calls[-1] == ON))
+                yield from super().generate(*args, **kwargs)
+        svc = Service(ObservedEngine(tok, "ok"), tok, ChatTemplate(ROOT / "serve/chat_template.jinja"))
         svc.keep_awake = ka = KeepAwake(rec)
         kinds = [k for k, _ in svc.run(tok.encode("hi"), False, None, 8, {}, threading.Event())]
         self.assertIn("done", kinds)
