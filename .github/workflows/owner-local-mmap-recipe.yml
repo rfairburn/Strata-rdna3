@@ -1,0 +1,24 @@
+name: Owner-local mmap recipe
+
+on:
+  push:
+    paths:
+      - 'rdna3/recipes/owner-local-mmap4k/**'
+      - '.github/workflows/owner-local-mmap-recipe.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  cpu-tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: python -B -m unittest discover -s rdna3/recipes/owner-local-mmap4k -p 'test_*.py' -v

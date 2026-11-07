@@ -1,0 +1,8 @@
+#!/bin/sh
+[ "${LD_PRELOAD+x}" != x ] || exit 125
+[ "${STRATA_CRASH_NUMERIC+x}" != x ] || exit 125
+[ "${1-}" = --serve ] || exit 125
+ulimit -S -c 0 || exit 125
+ulimit -H -c 0 || exit 125
+unset PWD || exit 125
+STRATA_HIPBLASLT_TUNING='' STRATA_HIPBLASLT_TABLE=off STRATA_PF_STEP_SYNC=1 exec @NATIVE@ "$@"
