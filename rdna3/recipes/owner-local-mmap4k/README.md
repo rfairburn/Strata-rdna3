@@ -18,7 +18,7 @@ rollback. Do not use this recipe to replace a working frontend with a newer one.
   string-to-string `env` object. The native executable and cwd must already
   exist. `gpu` and `layer_split` can be the comma-separated strings or integer
   lists. Other layouts are not inferred or converted.
-- The qualified native binary had SHA256
+- The historically qualified native binary had SHA256
   `5720b9747e2c46b8f014ffefff2b36caa353d752c9342cd3f140a0aa92400db1`.
   Pin and check the binary separately. This tool neither hashes nor runs it and
   cannot establish that another build is compatible.
@@ -86,7 +86,9 @@ Inspect the generated copy privately before using your existing manager to
 activate it. Keep that manager's original frontend, launch options and working
 cwd. The generated profile preserves `server_source` when present; it does not
 choose or install a frontend if the input does not name one. Do not use the
-repository's general setup/build/run scripts to activate this recipe.
+repository's general setup/build/run scripts to activate this recipe. Activation
+is a separate decision and requires restarting the native child; generating a
+bundle does not change a running process.
 
 ### Exact configuration delta
 
@@ -95,7 +97,10 @@ repository's general setup/build/run scripts to activate this recipe.
 - The sole `--prefill auto` becomes `--prefill 4096`.
 - Exactly one `--no-prefill-borrow` is appended.
 - Only these profile environment values are added/replaced:
-  `STRATA_ARENA_MMAP=1`, `STRATA_DP_PREFILL=0`, `STRATA_PREFILL_TIMING=1`.
+  `STRATA_ARENA_MMAP=1`, `STRATA_DP_PREFILL=0`.
+- Shared profile `env` neither gains nor overrides `STRATA_PREFILL_TIMING` or
+  `MALLOC_MMAP_THRESHOLD_`. Existing values, including empty strings, are preserved
+  for shared consumers such as vision.
 
 Everything else is preserved as JSON data, including unknown fields: original
 log, cwd, frontend, GPU order, parallelism, cuts, MTP/context/cache/thread/math
@@ -105,26 +110,49 @@ is created. No source stager, cuts, library paths or other flags are rewritten.
 
 The [eight-line launcher template](native-exec.sh.in) refuses observer variables
 and non-serve probes, sets both soft and hard child core limits to zero, unsets
-`PWD`, then execs the original absolute native path with unchanged arguments.
+`PWD` and `STRATA_PREFILL_TIMING`, then execs the original absolute native path
+with unchanged arguments. Any presence of `STRATA_PREFILL_TIMING`, even `0` or
+empty, enables native profiling hooks that are unsafe with overlapping workers.
+The wrapper removes inherited and profile-supplied values only for the native
+child; shared consumers keep the profile's value.
 It sets **only for that native exec**:
 
 - `STRATA_HIPBLASLT_TUNING=''`: overrides an inherited tuning-table path.
 - `STRATA_HIPBLASLT_TABLE=off`: selects the table-off/null state. Both Lt fields
   are needed; setting just one is not equivalent.
 - `STRATA_PF_STEP_SYNC=1`: the existing named-stream step synchronization path.
+- `MALLOC_MMAP_THRESHOLD_=131072`: a fixed Linux/glibc allocator workaround,
+  overriding any inherited or profile-supplied value in the native child.
 
-These three values are not changed in profile `env`, which can be shared with
-vision. They do not change the native image, parent limits, system core policy
+These four assignments are not made in shared profile `env`. `STRATA_KFDQ` is
+neither set nor unset; inheritance and opt-out remain unchanged. The allocator
+and profiling changes leave ordinary inference, math, assets and other settings
+unchanged. They do not change the native image, parent limits, system core policy
 or sysctls. There is no environment-sourced `NATIVE_BIN`, preload, crash handler,
 service, HTTP/API call, process manager or automatic fallback here.
+
+### Experimental allocator workaround
+
+On Linux/glibc, `free` can leave reusable pages inside allocator arenas rather
+than returning them to the OS. The OS-headroom gate sees OS-available memory,
+not that internal reusable capacity. The fixed threshold encourages eligible
+large allocations to use mmap so their pages can be returned on free. This is
+a possible allocator-retention mechanism, not a complete production root-cause
+finding or a universal leak or stability fix. Other allocators may ignore it.
+
+More mmap/munmap calls and more mappings can increase syscall cost, mapping-count
+pressure and performance overhead. Full-model memory and performance effects of
+this threshold and profiling suppression have not been qualified. CPU fixtures
+check environment handling, not allocator behavior or workload stability.
 
 ## Host validation and rollback
 
 Generation and CPU CI are not runtime qualification. After separate activation
 through the existing manager, validate on the target host before relying on it:
 
-1. Confirm the pinned native image/frontend, real child environment, PWD absence,
-   child core limits and all four intended GPUs, not just the JSON fields.
+1. Confirm the pinned native image/frontend, real child environment (including
+   PWD and profiling-variable absence and the fixed allocator threshold), child
+   core limits and all four intended GPUs, not just the JSON fields.
 2. Require native `LOADED`, manager `READY`, full owned expert residency
    `24576` total / `6144` per owner, no prefill borrowing and no fallback. A pack
    path or successful generator exit cannot establish these conditions.
@@ -134,10 +162,15 @@ through the existing manager, validate on the target host before relying on it:
 
 The generator never activates or restores a profile. For rollback, use the
 existing manager to restore the original pinned profile from
-`profile.original.json`, with its original native/frontend/pack. Keep that
-rollback available even after one successful run.
+`profile.original.json`, with its original launcher/native/frontend/pack, and
+restart the native child. Keep that rollback available even after one successful
+run.
 
 ## Observed bounds, not a general performance promise
+
+The following historical results and pinned-binary qualification predate the
+allocator threshold and native profiling suppression above. They do not qualify
+those additions or establish a matched performance comparison for them.
 
 The qualified host was a Threadripper PRO 3955WX (16 cores / 32 threads), 128 GiB
 RAM, four RX 7900 XTX 24 GiB cards (`gfx1100`), ROCm core 10.0. The native image
@@ -174,9 +207,13 @@ pinned rollback; this is not a new default recommendation.
 python3 -B -m unittest discover -s rdna3/recipes/owner-local-mmap4k -p 'test_*.py' -v
 ```
 
-Tests use synthetic profiles and temporary directories. They check the complete
-allowed delta, byte-preserved backup, quoting, fail-closed wrapper text, shell
-syntax, permissions, rejection cases and CLI acknowledgement. They never execute
-the native fixture, read a model payload, use a GPU/network/API or inspect a live
-process. The path-scoped `Owner-local mmap recipe` workflow runs the same tests on
-Python 3.11, without installing dependencies. It does not validate host behavior.
+Tests use synthetic profiles, temporary directories and a fake-native Python
+stub, never the real native executable. They check the complete allowed delta,
+byte-preserved backup, quoting, argv forwarding, fail-closed guards, shell syntax,
+core limits, permissions, rejection cases and CLI acknowledgement. Stub checks
+cover the native allocator override, shared-env isolation, profiling absence for
+inherited and input values `1`, `0` and empty, and unchanged native workarounds
+and KFD inheritance/opt-out. They do not read a model payload, use a GPU/network/API
+or inspect a live process. The path-scoped `Owner-local mmap recipe` workflow runs
+the same tests on Python 3.11, without installing dependencies. It does not
+validate host behavior.

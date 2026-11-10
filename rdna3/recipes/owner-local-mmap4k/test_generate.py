@@ -68,6 +68,31 @@ class RecipeTests(unittest.TestCase):
             command.append("--ack-pwd-absent")
         return subprocess.run(command + list(extra), capture_output=True, text=True, timeout=10)
 
+    def prepare_native_stub(self):
+        self.native.write_text(
+            '#!' + sys.executable + ' -B\n'
+            'import json, os, resource, sys\n'
+            'keys = ("PWD", "STRATA_PREFILL_TIMING", "MALLOC_MMAP_THRESHOLD_",\n'
+            '        "STRATA_HIPBLASLT_TUNING", "STRATA_HIPBLASLT_TABLE",\n'
+            '        "STRATA_PF_STEP_SYNC", "STRATA_KFDQ", "KEEP")\n'
+            'print(json.dumps({"argv": sys.argv[1:],\n'
+            '                  "env": {k: os.environ[k] for k in keys if k in os.environ},\n'
+            '                  "core": resource.getrlimit(resource.RLIMIT_CORE)}))\n',
+            encoding="utf-8",
+        )
+
+    def stub_environment(self):
+        env = dict(os.environ)
+        for key in ("LD_PRELOAD", "STRATA_CRASH_NUMERIC", "STRATA_PREFILL_TIMING",
+                    "MALLOC_MMAP_THRESHOLD_", "STRATA_KFDQ"):
+            env.pop(key, None)
+        env["PWD"] = str(self.root)
+        return env
+
+    def run_wrapper(self, args, env):
+        return subprocess.run([str(self.output / "native-exec.sh"), *args],
+                              env=env, capture_output=True, text=True, timeout=10)
+
     def rejected(self):
         original = self.source.read_bytes()
         result = self.cli()
@@ -94,7 +119,10 @@ class RecipeTests(unittest.TestCase):
         expected["args"][3] = "4096"
         expected["args"].append("--no-prefill-borrow")
         expected["env"].update(recipe.ENV_DELTA)
-        self.assertEqual(json.loads((self.output / "profile.json").read_bytes()), expected)
+        actual = json.loads((self.output / "profile.json").read_bytes())
+        self.assertEqual(actual, expected)
+        self.assertNotIn("STRATA_PREFILL_TIMING", actual["env"])
+        self.assertNotIn("MALLOC_MMAP_THRESHOLD_", actual["env"])
         self.assertEqual(self.source.read_bytes(), original)
         self.assertEqual((self.output / "profile.original.json").read_bytes(), original)
         self.assertEqual(self.native.read_bytes(), b"Inert CPU fixture: never execute this file.\n")
@@ -112,8 +140,9 @@ class RecipeTests(unittest.TestCase):
             '[ "${1-}" = --serve ] || exit 125\n'
             'ulimit -S -c 0 || exit 125\n'
             'ulimit -H -c 0 || exit 125\n'
-            'unset PWD || exit 125\n'
-            "STRATA_HIPBLASLT_TUNING='' STRATA_HIPBLASLT_TABLE=off STRATA_PF_STEP_SYNC=1 exec "
+            'unset PWD STRATA_PREFILL_TIMING || exit 125\n'
+            "MALLOC_MMAP_THRESHOLD_=131072 STRATA_HIPBLASLT_TUNING='' "
+            "STRATA_HIPBLASLT_TABLE=off STRATA_PF_STEP_SYNC=1 exec "
             + shlex.quote(str(self.native)) + ' "$@"\n'
         )
         self.assertEqual(launcher.read_text(), expected)
@@ -121,6 +150,73 @@ class RecipeTests(unittest.TestCase):
         self.assertNotIn("NATIVE_BIN", expected)
         checked = subprocess.run(["/bin/sh", "-n", str(launcher)], capture_output=True, timeout=10)
         self.assertEqual(checked.returncode, 0, checked.stderr)
+
+    def test_native_allocator_override_and_profiling_absence_preserve_shared_env(self):
+        self.prepare_native_stub()
+        args = ["--serve", "", "space and 'quote\"", "$inert;\\literal", "line\nbreak", "\u4e2d\u6587"]
+        for shared_timing in (None, "1", "0", ""):
+            for shared_allocator in (None, "262144"):
+                with self.subTest(shared_timing=shared_timing, shared_allocator=shared_allocator):
+                    for key, value in (("STRATA_PREFILL_TIMING", shared_timing),
+                                       ("MALLOC_MMAP_THRESHOLD_", shared_allocator)):
+                        self.cfg["env"].pop(key, None)
+                        if value is not None:
+                            self.cfg["env"][key] = value
+                    self.save()
+                    original = self.source.read_bytes()
+                    self.output = self.root / ("candidate-" + str(shared_timing) + "-" + str(shared_allocator))
+                    self.generate()
+                    shared_env = json.loads((self.output / "profile.json").read_bytes())["env"]
+                    expected = dict(self.cfg["env"], STRATA_ARENA_MMAP="1", STRATA_DP_PREFILL="0")
+                    self.assertEqual(shared_env, expected)
+                    inherited_cases = ((None, None), (None, "524288"), ("1", "524288"),
+                                       ("0", "524288"), ("", "524288"))
+                    for inherited_timing, inherited_allocator in inherited_cases:
+                        with self.subTest(inherited_timing=inherited_timing,
+                                          inherited_allocator=inherited_allocator):
+                            env = self.stub_environment()
+                            if inherited_allocator is not None:
+                                env["MALLOC_MMAP_THRESHOLD_"] = inherited_allocator
+                            if inherited_timing is not None:
+                                env["STRATA_PREFILL_TIMING"] = inherited_timing
+                                env["STRATA_KFDQ"] = "0"
+                            env.update(shared_env)
+                            before = dict(env)
+                            result = self.run_wrapper(args, env)
+                            self.assertEqual(result.returncode, 0, result.stderr)
+                            actual = json.loads(result.stdout)
+                            child_env = {
+                                "MALLOC_MMAP_THRESHOLD_": "131072",
+                                "STRATA_HIPBLASLT_TUNING": "",
+                                "STRATA_HIPBLASLT_TABLE": "off",
+                                "STRATA_PF_STEP_SYNC": "1",
+                                "KEEP": "unchanged",
+                            }
+                            if inherited_timing is not None:
+                                child_env["STRATA_KFDQ"] = "0"
+                            self.assertEqual(actual, {"argv": args, "env": child_env, "core": [0, 0]})
+                            self.assertEqual(env, before)
+                    self.assertEqual(self.source.read_bytes(), original)
+                    self.assertEqual((self.output / "profile.original.json").read_bytes(), original)
+                    self.assertEqual(json.loads((self.output / "profile.json").read_bytes())["env"], expected)
+
+    def test_wrapper_guards_prevent_stub_execution(self):
+        self.prepare_native_stub()
+        self.generate()
+        for key in ("LD_PRELOAD", "STRATA_CRASH_NUMERIC"):
+            # Whitespace tests presence without asking the loader to load a library.
+            for value in ("", " "):
+                with self.subTest(key=key, value=value):
+                    env = self.stub_environment()
+                    env[key] = value
+                    result = self.run_wrapper(["--serve"], env)
+                    self.assertEqual(result.returncode, 125, result.stderr)
+                    self.assertEqual(result.stdout, "")
+        for args in ([], ["--version"], ["other", "--serve"]):
+            with self.subTest(args=args):
+                result = self.run_wrapper(args, self.stub_environment())
+                self.assertEqual(result.returncode, 125, result.stderr)
+                self.assertEqual(result.stdout, "")
 
     def test_permissions_even_with_restrictive_umask(self):
         old = os.umask(0o777)
