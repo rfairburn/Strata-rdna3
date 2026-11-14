@@ -1211,24 +1211,26 @@ struct Prefill::Impl {
 struct Prefill::DpLink {
     std::mutex mu;
     std::condition_variable cv;
-    std::vector<int64_t> pub[2];        // per layer: the last chunk whose layer state path i has published (-1: none)
-    std::vector<cudaEvent_t> ev[2];     // per layer, recorded on path i's stream (its device)
-    int dev[2] = {0, 0};
+    std::vector<std::vector<int64_t>> pub;
+    std::vector<std::vector<cudaEvent_t>> ev;
+    std::vector<int> dev;
     bool abort = false;
     // [claude] DP share: path i's request for the other path's share of its chunk's MoE at a layer (k: the chunk, -1
     // none), and the chunk whose sums path i's help recorded (ev_sum on path i's device, after the copy into the
     // requester's H); ev_in / ev_pdone on the requester's device: its activations and routing / its own experts done
     struct DsReq { int64_t k = -1, T = 0; const void* xq = nullptr; const int32_t* ids = nullptr; const float* w = nullptr; void* h = nullptr; };
-    std::vector<DsReq> req[2];
-    std::vector<int64_t> sum_k[2];
-    std::vector<cudaEvent_t> ev_in[2], ev_pdone[2], ev_sum[2];
+    std::vector<std::vector<DsReq>> req;
+    std::vector<std::vector<int64_t>> sum_k;
+    std::vector<std::vector<cudaEvent_t>> ev_in, ev_pdone, ev_sum;
     // [claude] TP prefill: per (layer, exchange) the event path i recorded on its copy stream after that exchange's
     // copies, and the chunk (Prefill::tp_chunk_) it was for (-1: none yet)
     static constexpr int kTpX = 8;
-    std::vector<cudaEvent_t> tev[2];
-    std::vector<int64_t> tseq[2];
+    std::vector<std::vector<cudaEvent_t>> tev;
+    std::vector<std::vector<int64_t>> tseq;
+    explicit DpLink(size_t n = 2) : pub(n), ev(n), dev(n), req(n), sum_k(n),
+                                    ev_in(n), ev_pdone(n), ev_sum(n), tev(n), tseq(n) {}
     ~DpLink() {
-        for (int i = 0; i < 2; ++i) {
+        for (size_t i = 0; i < dev.size(); ++i) {
             const core::OnDevice on(dev[i]);
             for (cudaEvent_t e : ev[i]) if (e) cudaEventDestroy(e);
             for (cudaEvent_t e : tev[i]) if (e) cudaEventDestroy(e);
@@ -3133,7 +3135,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
         const char* e = std::getenv("STRATA_KV_PREFETCH");
         return e ? std::atoi(e) != 0 : false;
     }();
-    const bool kv_prefetch = kv_prefetch_on;
+    const bool kv_prefetch = kv_prefetch_on && (!dp || dp_link_->dev.size() == 2);
     if (kv_prefetch) {
         if ((!m.kv_copy && cudaStreamCreateWithFlags(&m.kv_copy, cudaStreamNonBlocking) != cudaSuccess) ||
             (!m.kv_released && cudaEventCreateWithFlags(&m.kv_released, cudaEventDisableTiming) != cudaSuccess) ||
@@ -7023,7 +7025,10 @@ void Prefill::set_dp(Prefill* peer, core::SessionState* foreign, int64_t own_lb,
 }
 
 namespace {
-// the state of a GDN / QSA ordinal in whichever of a DP path's two sessions holds it
+// The native two-path helpers also serve the N-path state handoff.
+core::SessionState& dp_gdn_session(core::SessionState& own, core::SessionState* foreign, int64_t gi) {
+    return gi >= own.gdn_ord0 && gi < own.gdn_ord0 + own.gdn_alloc ? own : *foreign;
+}
 float* dp_gdn_of(core::SessionState& own, core::SessionState* foreign, int64_t gi, uint64_t floats) {
     core::SessionState& S = (gi >= own.gdn_ord0 && gi < own.gdn_ord0 + own.gdn_alloc) || foreign == nullptr ? own : *foreign;
     return S.gdn_state + (size_t) (gi - S.gdn_ord0) * floats;
@@ -7039,7 +7044,7 @@ core::PleRun& dp_ple_of(core::SessionState& own, core::SessionState* foreign) {
 
 bool Prefill::dp_wait(int64_t l, int64_t k, std::string& err) {
     DpLink& L = *dp_link_;
-    const int peer = 1 - dp_index_;
+    const int peer = (dp_index_ + (int) L.dev.size() - 1) % (int) L.dev.size();
     {
         std::unique_lock<std::mutex> lk(L.mu);
         L.cv.wait(lk, [&] { return L.abort || L.pub[peer][(size_t) l] >= k - 1; });
@@ -7054,50 +7059,17 @@ bool Prefill::dp_wait(int64_t l, int64_t k, std::string& err) {
 }
 
 bool Prefill::dp_publish(int64_t l, int64_t k, int64_t p0, int64_t T, std::string& err) {
-    Impl& m = *impl_;
-    Impl& pm = *dp_peer_->impl_;
-    DpLink& L = *dp_link_;
-    const core::ModelGeometry& g = *m.g;
-    const int me = dp_index_;
-    const int my_dev = m.device, peer_dev = pm.device;
-    int64_t qi = 0, gi = 0;
-    for (int64_t i = 0; i < l; ++i) (core::is_qsa_layer(g, i) ? qi : gi) += 1;
-    bool ok = true;
-    auto cp = [&](void* dst, const void* src, size_t bytes) {
-        if (ok && bytes > 0 && cudaMemcpyPeerAsync(dst, peer_dev, src, my_dev, bytes, m.cs) != cudaSuccess) ok = false;
-    };
-    if (core::is_qsa_layer(g, l)) {
-        // the K/V went to the shared host copy (the append); the indexer's rows of this chunk, its tail, dead slot and
-        // block position go to the other path's state
-        const strata::kernels::QsaShapes s = strata::kernels::qsa_real_shapes();
-        const core::QsaState& a = dp_qsa_of(*m.ss, dp_foreign_, qi);
-        core::QsaState& b = dp_qsa_of(*pm.ss, dp_peer_->dp_foreign_, qi);
-        const int64_t D = g.idx_key_dim, blk = s.idx_block;
-        const int64_t r0 = std::min<int64_t>(p0 / blk, a.idx_pooled_rows);
-        const int64_t r1 = std::min<int64_t>((p0 + T) / blk + 2, a.idx_pooled_rows);
-        if (r1 > r0) cp(b.idx_pooled + r0 * D, a.idx_pooled + r0 * D, (size_t) ((r1 - r0) * D) * 4);
-        cp(b.idx_tail, a.idx_tail, (size_t) ((blk - 1) * D) * 4);
-        cp(b.idx_dead, a.idx_dead, (size_t) D * 4);
-        cp(b.idx_block_pos, a.idx_block_pos, 4);
-    } else {
-        const uint64_t floats = (uint64_t) g.ssm_state_size * g.ssm_v_heads * g.ssm_state_size +
-                                (uint64_t) g.ssm_conv_channels * (g.ssm_d_conv - 1);
-        cp(dp_gdn_of(*pm.ss, dp_peer_->dp_foreign_, gi, floats), dp_gdn_of(*m.ss, dp_foreign_, gi, floats), (size_t) floats * 4);
-    }
-    if (l == 1) {
-        core::PleRun& a = dp_ple_of(*m.ss, dp_foreign_);
-        core::PleRun& b = dp_ple_of(*pm.ss, dp_peer_->dp_foreign_);
-        if (a.hist != nullptr && b.hist != nullptr)
-            cp(b.hist, a.hist, (size_t) strata::kernels::NG_HIST * strata::kernels::NG_HC_DIM * 4);
-    }
-    if (!ok || cudaEventRecord(L.ev[me][(size_t) l], m.cs) != cudaSuccess) {
-        err = std::string("prefill DP: the state hand-off of layer ") + std::to_string(l) + ": " +
-              cudaGetErrorString(cudaGetLastError());
+    auto& L = *dp_link_;
+    const int64_t begin = dp::handoff_begin(dp_plan_, k, (int) L.dev.size());
+    const int64_t from = p0 - dp_plan_[(size_t) k].c0 + begin;
+    if (!dp_copy_layer(*dp_peer_, l, from, p0 + T - from, err)) return false;
+    if (cudaEventRecord(L.ev[dp_index_][(size_t) l], impl_->cs) != cudaSuccess) {
+        err = "prefill DP: state handoff event failed";
         return false;
     }
     {
         std::lock_guard<std::mutex> lk(L.mu);
-        L.pub[me][(size_t) l] = k;
+        L.pub[dp_index_][(size_t) l] = k;
     }
     L.cv.notify_all();
     return true;
@@ -7116,15 +7088,8 @@ bool Prefill::run_dp(Prefill& a, Prefill& b, const int64_t* tokens, int64_t n, i
         err = "prefill DP: the prompt starts inside a K/V block";
         return false;
     }
-    // an even number of balanced chunks (multiples of 256), the last one on b (the drafter's GPU)
-    int64_t k = std::max<int64_t>(2, (n + C - 1) / C);
-    if (k & 1) ++k;
-    int64_t step = ((n + k - 1) / k + 255) / 256 * 256;
-    if (step > C) { err = "prefill DP: the plan does not fit the chunk"; return false; }
-    std::vector<DpChunk> plan;
-    for (int64_t c0 = 0; c0 < n; c0 += step) plan.push_back({c0, std::min(step, n - c0), (int64_t) plan.size(), 0});
-    for (size_t i = 0; i < plan.size(); ++i) plan[i].who = ((plan.size() - 1 - i) % 2 == 0) ? 1 : 0;
-    if (plan.size() < 2 || plan.back().T < min_last) { err = "prefill DP: the prompt is too short for the plan"; return false; }
+    const auto plan = dp::plan(n, C, 2, min_last);
+    if (plan.empty()) { err = "prefill DP: the prompt is too short for the plan"; return false; }
     // per prompt: the plan, each path's residency view (the experts of the layers it does not own are streamed), the
     // layer range, no stage chaining or per-stage checkpoint parts
     struct Saved { int64_t lb, le; Prefill* next; const int32_t* res; std::function<bool(int64_t, std::string&)> osc; };
@@ -7294,6 +7259,237 @@ bool Prefill::run_dp(Prefill& a, Prefill& b, const int64_t* tokens, int64_t n, i
     return true;
 }
 
+
+std::shared_ptr<Prefill::DpLink> Prefill::make_dp_link(int n_layers, const std::vector<int>& devices,
+                                                    std::string& err) {
+    if (devices.size() < 2 || n_layers < 1) { err = "prefill DP: invalid paths"; return nullptr; }
+    auto L = std::make_shared<DpLink>(devices.size());
+    L->dev = devices;
+    for (size_t i = 0; i < devices.size(); ++i) {
+        const core::OnDevice on(L->dev[i]);
+        L->pub[i].assign((size_t) n_layers, -1);
+        L->ev[i].assign((size_t) n_layers, nullptr);
+        for (int l = 0; l < n_layers; ++l)
+            if (cudaEventCreateWithFlags(&L->ev[i][(size_t) l], cudaEventDisableTiming) != cudaSuccess) {
+                err = "prefill DP: events";
+                return nullptr;
+            }
+        if (devices.size() == 2 && dp_share_env()) {   // the two-path expert share
+            L->req[i].assign((size_t) n_layers, DpLink::DsReq{});
+            L->sum_k[i].assign((size_t) n_layers, -1);
+            for (auto* v : {&L->ev_in[i], &L->ev_pdone[i], &L->ev_sum[i]}) {
+                v->assign((size_t) n_layers, nullptr);
+                for (cudaEvent_t& e : *v)
+                    if (cudaEventCreateWithFlags(&e, cudaEventDisableTiming) != cudaSuccess) { err = "prefill DP: share events"; return nullptr; }
+            }
+        }
+        // direct copies between the two cards where the platform allows it (else cudaMemcpyPeer stages through RAM)
+        const int peer = L->dev[(i + 1) % devices.size()];
+        int can = 0;
+        if (cudaDeviceCanAccessPeer(&can, L->dev[i], peer) == cudaSuccess && can) {
+            const cudaError_t e = cudaDeviceEnablePeerAccess(peer, 0);
+            if (e != cudaSuccess && e != cudaErrorPeerAccessAlreadyEnabled) {
+                cudaGetLastError();
+                std::fprintf(stderr, "prefill DP: peer access CUDA%d -> CUDA%d failed: %s\n", L->dev[i], peer,
+                             cudaGetErrorString(e));
+            }
+            cudaGetLastError();
+        }
+        std::fprintf(stderr, "prefill DP: CUDA%d -> CUDA%d peer access %s\n", L->dev[i], peer, can ? "on" : "off");
+    }
+    return L;
+}
+
+bool Prefill::dp_copy_layer(Prefill& target, int64_t l, int64_t p0, int64_t T, std::string& err) {
+    Impl& m = *impl_;
+    Impl& pm = *target.impl_;
+    const core::OnDevice on(m.device);
+    const core::ModelGeometry& g = *m.g;
+    int64_t qi = 0, gi = 0;
+    for (int64_t i = 0; i < l; ++i) (core::is_qsa_layer(g, i) ? qi : gi) += 1;
+    bool ok = true;
+    auto cp = [&](void* dst, const void* src, size_t bytes) {
+        if (ok && bytes && cudaMemcpyPeerAsync(dst, pm.device, src, m.device, bytes, m.cs) != cudaSuccess) ok = false;
+    };
+    if (core::is_qsa_layer(g, l)) {
+        const auto s = core::qsa_shapes(g);
+        const auto& a = dp_qsa_of(*m.ss, dp_foreign_, qi);
+        auto& b = dp_qsa_of(*pm.ss, target.dp_foreign_, qi);
+        const int64_t D = g.idx_key_dim, blk = s.idx_block;
+        const int64_t r0 = std::min<int64_t>(p0 / blk, a.idx_pooled_rows);
+        const int64_t r1 = std::min<int64_t>((p0 + T) / blk + 2, a.idx_pooled_rows);
+        if (r1 > r0) cp(b.idx_pooled + r0 * D, a.idx_pooled + r0 * D, (size_t) ((r1 - r0) * D) * 4);
+        cp(b.idx_tail, a.idx_tail, (size_t) ((blk - 1) * D) * 4);
+        cp(b.idx_dead, a.idx_dead, (size_t) D * 4);
+        cp(b.idx_block_pos, a.idx_block_pos, 4);
+    } else {
+        const uint64_t floats = (uint64_t) g.ssm_state_size * g.ssm_v_heads * g.ssm_state_size +
+                                (uint64_t) g.ssm_conv_channels * (g.ssm_d_conv - 1);
+        auto& a = dp_gdn_session(*m.ss, dp_foreign_, gi);
+        auto& b = dp_gdn_session(*pm.ss, target.dp_foreign_, gi);
+        cp(b.gdn_state + (size_t) (gi - b.gdn_ord0) * floats,
+           a.gdn_state + (size_t) (gi - a.gdn_ord0) * floats, (size_t) floats * 4);
+    }
+    if (l == 1) {
+        auto& a = dp_ple_of(*m.ss, dp_foreign_);
+        auto& b = dp_ple_of(*pm.ss, target.dp_foreign_);
+        if (a.hist && b.hist) cp(b.hist, a.hist, (size_t) strata::kernels::NG_HIST * strata::kernels::NG_HC_DIM * 4);
+    }
+    if (!ok) err = "prefill DP: state copy of layer " + std::to_string(l) + " failed";
+    return ok;
+}
+
+bool Prefill::run_dp(const std::vector<Prefill*>& paths, const int64_t* tokens, int64_t n, int64_t pos0,
+                     int64_t chunk, int64_t min_last, std::string& err) {
+    if (paths.size() == 2 && paths[0] && paths[1])
+        return run_dp(*paths[0], *paths[1], tokens, n, pos0, chunk, min_last, err);
+    const int N = (int) paths.size();
+    if (N < 2 || !paths.front() || !paths.front()->dp_link_ || paths.front()->dp_link_->dev.size() != paths.size()) {
+        err = "prefill DP: paths are not linked";
+        return false;
+    }
+    auto& L = *paths.front()->dp_link_;
+    int64_t C = chunk, end = 0;
+    for (int i = 0; i < N; ++i) {
+        auto* p = paths[(size_t) i];
+        if (!p || !p->impl_ || !p->dp_foreign_ || p->dp_link_.get() != &L || p->dp_index_ != i ||
+            p->dp_peer_ != paths[(size_t) ((i + 1) % N)] || p->impl_->device != L.dev[(size_t) i] ||
+            p->dp_own_lb_ != end || p->dp_own_le_ <= end) {
+            err = "prefill DP: invalid path or owner range";
+            return false;
+        }
+        C = std::min(C, p->impl_->T);
+        end = p->dp_own_le_;
+    }
+    const auto& g = *paths.front()->impl_->g;
+    if (end != g.n_layers || pos0 < 0 || n <= 0 || pos0 > paths.front()->impl_->ss->max_cells - n) {
+        err = "prefill DP: invalid prompt or layer owners";
+        return false;
+    }
+    if (pos0 % core::qsa_shapes(g).idx_block != 0) {
+        err = "prefill DP: decline: alignment requires the layer pipeline";
+        return false;
+    }
+    for (auto* p : paths) if (p->embd_rows || !p->tap_layers_.empty() || p->stop_at_chunk) {
+        err = "prefill DP: decline: images, taps or cooperative reads require the layer pipeline";
+        return false;
+    }
+    const auto plan = dp::plan(n, C, N, min_last);
+    if (plan.empty()) { err = "prefill DP: decline: short prompt"; return false; }
+    struct Saved {
+        int64_t lb, le;
+        Prefill* next;
+        const float* hand;
+        const void* ev;
+        int pieces;
+        const int32_t* res;
+        std::function<bool(int64_t, std::string&)> osc;
+    };
+    std::vector<Saved> saved;
+    saved.reserve(paths.size());
+    // All throwing allocations precede the per-prompt overrides.
+    for (auto* p : paths) {
+        saved.push_back({p->stage_lb_, p->stage_le_, p->next_, p->hand_in_, p->hand_ev_, p->hand_pieces_,
+                         p->impl_->host_res, p->on_stage_chunk});
+        p->dp_plan_ = plan;
+        p->dp_res_.assign((size_t) (g.n_layers * g.n_expert), -1);
+        if (p->impl_->host_res)
+            std::copy(p->impl_->host_res + p->dp_own_lb_ * g.n_expert,
+                      p->impl_->host_res + p->dp_own_le_ * g.n_expert,
+                      p->dp_res_.begin() + p->dp_own_lb_ * g.n_expert);
+    }
+    auto drain = [&] {
+        bool ok = true;
+        for (auto* p : paths) {
+            const core::OnDevice on(p->impl_->device);
+            // Nice queues PLE uploads on cs; it has no separate PLE copy stream.
+            for (auto s : {p->impl_->cs, p->impl_->copy, p->impl_->kv_copy})
+                if (s && cudaStreamSynchronize(s) != cudaSuccess) ok = false;
+        }
+        return ok;
+    };
+    struct Restore {
+        std::function<void()> f;
+        ~Restore() { f(); }
+    } restore{[&] {
+        drain();
+        for (int i = 0; i < N; ++i) {
+            auto& p = *paths[(size_t) i];
+            auto& s = saved[(size_t) i];
+            p.stage_lb_ = s.lb; p.stage_le_ = s.le; p.next_ = s.next;
+            p.hand_in_ = s.hand; p.hand_ev_ = s.ev; p.hand_pieces_ = s.pieces;
+            p.impl_->host_res = s.res; p.on_stage_chunk = std::move(s.osc); p.dp_active_ = false;
+        }
+    }};
+    for (auto* p : paths) {
+        p->stage_lb_ = 0; p->stage_le_ = g.n_layers; p->next_ = nullptr;
+        p->hand_in_ = nullptr; p->hand_ev_ = nullptr; p->hand_pieces_ = 0;
+        p->on_stage_chunk = nullptr; p->impl_->host_res = p->dp_res_.data(); p->dp_active_ = true;
+        p->dp_last_p0_ = pos0 + plan.back().c0;
+    }
+    {
+        std::lock_guard<std::mutex> lk(L.mu);
+        L.abort = false;
+        for (auto& pub : L.pub) std::fill(pub.begin(), pub.end(), (int64_t) -1);
+    }
+    // Owners may have decoded since the last prompt. Drain them before any cross-device read.
+    if (!drain()) { err = "prefill DP: initial drain failed"; return false; }
+    for (auto* p : paths) {
+        const core::OnDevice on(p->impl_->device);
+        for (auto* s : {p->impl_->ss, p->dp_foreign_})
+            for (int64_t q = s->qsa_ord0; q < s->qsa_ord0 + s->qsa_alloc; ++q)
+                strata::kernels::kv_stream_reset(s->qsa_states[q].map, p->impl_->cs);
+    }
+    if (!drain()) { err = "prefill DP: resetting residency failed"; return false; }
+    for (auto* p : paths)
+        for (auto* owner : paths) if (owner != p)
+            for (int64_t l = owner->dp_own_lb_; l < owner->dp_own_le_; ++l)
+                if (!owner->dp_copy_layer(*p, l, 0, pos0, err)) return false;
+    if (!drain()) { err = "prefill DP: syncing foreign state failed"; return false; }
+    const int32_t prev[2] = {paths.front()->impl_->ss->ple_prev[0], paths.front()->impl_->ss->ple_prev[1]};
+    for (auto* p : paths) for (auto* s : {p->impl_->ss, p->dp_foreign_}) {
+        s->ple_prev[0] = prev[0]; s->ple_prev[1] = prev[1];
+    }
+    std::vector<std::string> errors(paths.size());
+    std::vector<char> ok(paths.size(), false);
+    auto abort = [&] {
+        { std::lock_guard<std::mutex> lk(L.mu); L.abort = true; }
+        L.cv.notify_all();
+    };
+    auto run_path = [&](int i) {
+        try {
+            if (i + 1 < N) strata::aux_cpus::pin_current_thread();
+            ok[(size_t) i] = paths[(size_t) i]->run_impl(tokens, n, pos0, errors[(size_t) i]);
+        } catch (const std::exception& e) { errors[(size_t) i] = e.what(); }
+        catch (...) { errors[(size_t) i] = "prefill DP: path threw"; }
+        if (!ok[(size_t) i]) abort();
+    };
+    std::vector<std::future<void>> futures;
+    try {
+        futures.reserve(paths.size() - 1);
+        for (int i = 0; i + 1 < N; ++i) futures.push_back(std::async(std::launch::async, [&, i] { run_path(i); }));
+        run_path(N - 1);
+    } catch (const std::exception& e) { errors.back() = e.what(); abort(); }
+    for (auto& f : futures) f.get();
+    if (!drain()) { err = "prefill DP: completed path drain failed"; return false; }
+    if (!std::all_of(ok.begin(), ok.end(), [](char v) { return v != 0; })) {
+        err = "prefill DP: a path failed";
+        for (const auto& e : errors) if (!e.empty()) err += "; " + e;
+        return false;
+    }
+    // The terminal chunk has all final layer states; return every slice to its decode owner.
+    auto& last = *paths.back();
+    for (auto* p : paths) if (p != &last)
+        for (int64_t l = p->dp_own_lb_; l < p->dp_own_le_; ++l)
+            if (!last.dp_copy_layer(*p, l, pos0, n, err)) return false;
+    if (!drain()) { err = "prefill DP: returning owner state failed"; return false; }
+    int32_t pv[2] = {prev[0], prev[1]};
+    for (int64_t t = 0; t < n; ++t) { pv[0] = pv[1]; pv[1] = (int32_t) tokens[t]; }
+    for (auto* p : paths) for (auto* s : {p->impl_->ss, p->dp_foreign_}) {
+        s->ple_prev[0] = pv[0]; s->ple_prev[1] = pv[1];
+    }
+    return true;
+}
 
 // ---- [claude] TP prefill (docs/STRATA_TP_PREFILL_DESIGN_20261101.txt)
 bool Prefill::tp_prefill_env() { return tp_prefill_on(); }

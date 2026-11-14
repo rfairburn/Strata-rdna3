@@ -121,7 +121,7 @@ int sys_queues(uint32_t gpu, int* others) {
 
 void* watcher(void*) {
     long last_act = now_ms();
-    bool parked = false;
+    bool parked = false, wake_pending = false;
     for (;;) {
         usleep(parked ? poll_us : 20000);
         bool act = false;
@@ -135,15 +135,17 @@ void* watcher(void*) {
         }
         long t = now_ms();
         if (act) last_act = t;
-        if (parked && act) {
+        if (parked && (act || wake_pending)) {
+            wake_pending = false;
             for (auto& q : qs)
                 if (q.used && q.parked) {
                     double t0 = wall();
                     int rc = set_pct(q, run_pct(q));
-                    q.parked = 0;
+                    if (rc == 0) q.parked = 0;
+                    else wake_pending = true;
                     if (logon) fprintf(stderr, "[kfdq %.3f] unpark gpu %u q %u rc %d ioctl_ms %.2f\n", wall(), q.a.gpu_id, q.a.queue_id, rc, (wall() - t0) * 1e3);
                 }
-            parked = false;
+            parked = wake_pending;
         } else if (!parked && t - last_act >= idle_ms) {
             // Per GPU: park the utility queue when this process alone holds more than the slots; when other processes
             // also hold queues there (e.g. a vision server) and the card's total is over the slots, park every queue

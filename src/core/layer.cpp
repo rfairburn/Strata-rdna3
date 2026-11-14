@@ -791,7 +791,7 @@ uint64_t qsa_state_bytes(const ModelGeometry& g, int64_t max_cells, bool with_ro
 }
 
 uint64_t qsa_state_init(const ModelGeometry& g, int64_t max_cells, void* base, QsaState& st,
-                        const QsaState* share_rope, int64_t ring_cells) {
+                        const QsaState* share_rope, int64_t ring_cells, const QsaState* share_host) {
     const QsaShapes s = qsa_shapes(g);
     const KvPlan p = kv_plan(s, max_cells, ring_cells);
     const int64_t pages = p.pages;
@@ -907,8 +907,13 @@ uint64_t qsa_state_init(const ModelGeometry& g, int64_t max_cells, void* base, Q
         const uint64_t bytes = (uint64_t) pages * strata::kernels::kv_block_bytes(s, qsa_kv_format(st)) + 4 * 256;
         uint8_t* h = nullptr;
         uint8_t* d = nullptr;
-        if ((h = kv_host_alloc(bytes)) == nullptr ||
-            cudaHostGetDevicePointer((void**) &d, h, 0) != cudaSuccess) {
+        if (share_host) {
+            if (share_host->kv_mode != p.mode || share_host->max_cells != max_cells ||
+                qsa_kv_format(*share_host) != qsa_kv_format(st) || share_host->kv_host_bytes != bytes ||
+                !share_host->kv_host_base) return 0;
+            h = (uint8_t*) share_host->kv_host_base;
+        } else h = kv_host_alloc(bytes);
+        if (!h || cudaHostGetDevicePointer((void**) &d, h, 0) != cudaSuccess) {
             // both cudaHostRegister and cudaHostAlloc were refused (kv_host_alloc): usually not enough free RAM
             if (p.mode == 1) std::fprintf(stderr, "strata: KV streaming: cannot pin %.2f GiB of RAM for a layer's KV copy "
                                  "(%.2f GiB pinned so far): RAM or the driver refused to pin it - lower the context, "
@@ -916,7 +921,9 @@ uint64_t qsa_state_init(const ModelGeometry& g, int64_t max_cells, void* base, Q
                                  (double) g_kv_host_bytes / 1073741824.0);
             return 0;
         }
-        g_kv_host_bytes += bytes;
+        if (!share_host) g_kv_host_bytes += bytes;
+        st.kv_host_base = h;
+        st.kv_host_bytes = bytes;
         Cursor hc{d};
         if (st.kv_hybrid) {
             st.host.k_q = hc.take<int8_t>(hrows * s.head_dim);
